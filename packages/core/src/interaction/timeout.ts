@@ -10,7 +10,7 @@ import { type ActorInvocationContext, invocationKey, sameInvocation, type Invoca
 
 import { recordedDispatchOf, terminalInvocationRefOf, terminalStorageKey, type RecordedDispatch } from "./records-compat"
 
-import { cancellationStateOf, initialMethodStates, reduceMethodStates } from "./state"
+import { cancellationStateOf, initialMethodStates, reduceMethodStates, type ActorMethodView } from "./state"
 import { type ActorMethods } from "../actor/method"
 
 export interface AlarmFiredFields {
@@ -52,7 +52,7 @@ const dispatchesOf = (log: ReadonlyArray<Event>): ReadonlyArray<RecordedDispatch
   return dispatch === undefined ? [] : [dispatch]
 })
 
-interface InvocationDeadline {
+export interface InvocationDeadline {
   readonly invocation: InvocationRef
   readonly deadlineAt: number
 }
@@ -142,6 +142,42 @@ const deadlineCancellationTransition = (invocation: InvocationRef, deadlineAt: n
   })]
 })
 
+// deadlineCancellationsAt projects the invocation deadlines an observed time has crossed into the same cancellation targets the caller path uses.
+export const deadlineCancellationsAt = (
+  log: ReadonlyArray<Event>,
+  methods: ActorMethods,
+  at: number
+): ReadonlyArray<InvocationDeadline> => {
+  const views = new Map<string, ActorMethodView<unknown>>()
+  return invocationDeadlinesOf(log).flatMap(({ invocation, deadlineAt }) => {
+    if (deadlineAt > at) return []
+    const method = methods[invocation.method]
+    if (method === undefined || method.cancellation === undefined || invocationSettled(log, invocation)) return []
+    let view = views.get(invocation.method)
+    if (view === undefined) {
+      view = replayProjection(method.projection, log)
+      views.set(invocation.method, view)
+    }
+    return cancellationStateOf(method, view, invocation) !== "running" ? [] : [{ invocation, deadlineAt }]
+  })
+}
+
+// deadlineCancellationEventsAt constructs the durable cancellation requests one observed crossing commits alongside its alarm fact.
+export const deadlineCancellationEventsAt = (
+  log: ReadonlyArray<Event>,
+  methods: ActorMethods,
+  at: number
+): ReadonlyArray<Event> =>
+  deadlineCancellationsAt(log, methods, at).map(({ invocation, deadlineAt }) =>
+    cancellationRequested({
+      request: `deadline/${invocation.method}/${invocation.id}/${invocation.epoch}/${deadlineAt}`,
+      invocation,
+      cause: "deadline",
+      deadlineAt,
+      at
+    })
+  )
+
 // methodTimeoutDerivation turns alarm facts into method terminals without reading a clock.
 export const methodTimeoutDerivation: CompleteTransitionDerivation = (log) => {
   const terminal = terminalCalls(log)
@@ -153,19 +189,13 @@ export const methodTimeoutDerivation: CompleteTransitionDerivation = (log) => {
   })
 }
 
-// methodDeadlineCancellationDerivation turns an accepted invocation deadline into the same durable cancellation used by callers.
-export const methodDeadlineCancellationDerivation = (methods: ActorMethods): CompleteTransitionDerivation => (log) => {
-  const alarms = alarmsOf(log)
-  return invocationDeadlinesOf(log).flatMap(({ invocation, deadlineAt }) => {
-    const cancellation = methods[invocation.method]?.cancellation
-    if (cancellation === undefined || invocationSettled(log, invocation)) return []
-    const alarm = alarmFor(alarms, deadlineAt)
-    const method = methods[invocation.method]
-    if (alarm === undefined || method === undefined ||
-      cancellationStateOf(method, replayProjection(method.projection, log), invocation) !== "running") return []
-    return [deadlineCancellationTransition(invocation, deadlineAt)]
-  })
-}
+// methodDeadlineCancellationDerivation projects the deadline cancellations a recorded alarm crossed, for logs written before the alarm handler committed them (timeout.test.ts, "a crossed deadline projects its cancellation before and after commit").
+export const methodDeadlineCancellationDerivation = (methods: ActorMethods): CompleteTransitionDerivation => (log) =>
+  alarmsOf(log).flatMap((alarm) =>
+    deadlineCancellationsAt(log, methods, alarm.at).map(({ invocation, deadlineAt }) =>
+      deadlineCancellationTransition(invocation, deadlineAt)
+    )
+  )
 
 /** @deprecated Use methodTimeoutDerivation. This compatibility name describes a complete-history transition derivation. */
 export const methodTimeoutReactor: CompleteTransitionDerivation = (log) => methodTimeoutDerivation(log)
