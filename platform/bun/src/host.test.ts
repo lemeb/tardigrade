@@ -3,9 +3,10 @@ import { Database } from "bun:sqlite"
 import { existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, Layer, Tracer } from "effect"
+import { Effect, Layer, Schema, Tracer } from "effect"
 import type { KeyValueStore } from "effect/unstable/persistence"
 import type { Event } from "@clavia/tardigrade-core/log/event"
+import { actor, actorMethod, component } from "@clavia/tardigrade-core/actor"
 import { effect } from "@clavia/tardigrade-core/effect"
 import { actorFromProjections, type Actor } from "@clavia/tardigrade-core/runtime"
 import { completeTransitionProjection, type ErasedTransitionProjection } from "@clavia/tardigrade-core/transition"
@@ -453,6 +454,109 @@ describe("the bun host", () => {
     expect(recoveredAlarm.pending).toEqual([])
     expect(await recovered.resting()).toBe(true)
     await recovered.close()
+  })
+
+  test("an alarm commits its deadline cancellation atomically", async () => {
+    const path = freshPath()
+    interface HoldState {
+      readonly requests: ReadonlySet<string>
+      readonly cancelled: ReadonlySet<string>
+    }
+    const initialHoldState = (): HoldState => ({ requests: new Set(), cancelled: new Set() })
+    const stepHoldState = (hold: HoldState, event: Event): HoldState => {
+      const id = String((event as { readonly id?: unknown }).id ?? "")
+      if (event.type === "HoldRequested" && !hold.requests.has(id)) {
+        return { ...hold, requests: new Set(hold.requests).add(id) }
+      }
+      if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
+        return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
+      }
+      return hold
+    }
+    const hold = actorMethod({
+      input: Schema.Struct({ text: Schema.String }),
+      output: Schema.String,
+      event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
+      projection: {
+        initial: initialHoldState,
+        step: stepHoldState,
+        output: (hold: HoldState) => ({
+          currentEpoch: () => 0,
+          invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
+            : hold.cancelled.has(invocation.id)
+              ? { status: "cancelled" as const, cause: "deadline" as const }
+              : { status: "pending" as const }
+        })
+      },
+      cancellation: {
+        event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
+      }
+    })
+    const holdComponent = component<HoldState, undefined>({
+      name: "hold",
+      keys: {
+        prefixes: ["hold-request:", "hold-cancel:"],
+        keyOf: (event) => {
+          if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
+          if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
+          return undefined
+        }
+      },
+      initial: initialHoldState,
+      step: stepHoldState,
+      output: () => ({ view: undefined, transitions: [] })
+    })
+    const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
+    const alarm = new ManualAlarmScheduler()
+    const h = await createBunHost({
+      database: path,
+      actorFor: () => holdActor,
+      keyOf: holdActor.keyOf,
+      alarm
+    })
+    await h.seed("caller", [
+      created("caller"),
+      {
+        type: "HoldRequested",
+        id: "hold-1",
+        text: "held",
+        call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt: 50 },
+        at: 1
+      } as Event
+    ])
+    await h.recover()
+    expect(alarm.pending).toEqual([50])
+    expect(h.work()).toBe(0)
+
+    // A rejected cancellation insert aborts the whole batch, alarm fact included, and leaves the driver unmarked.
+    const threadDb = new Database(bunThreadDatabasePath(path, "caller"))
+    threadDb.exec(`CREATE TRIGGER reject_deadline_cancellation
+      BEFORE INSERT ON events
+      WHEN NEW.key LIKE 'cx:%'
+      BEGIN SELECT RAISE(ABORT, 'reject deadline cancellation'); END`)
+    await expect(alarm.advanceTo(60)).rejects.toThrow()
+    const rejected = await h.read("caller")
+    expect(rejected.filter((event) => event.type === "AlarmFired")).toEqual([])
+    expect(rejected.filter((event) => event.type === "CancellationRequested")).toEqual([])
+    expect(h.work()).toBe(0)
+    expect(alarm.pending).toEqual([])
+
+    // The aborted batch left the deadline uncrossed, so a clean retry commits alarm fact and cancellation together.
+    await h.wake("caller")
+    expect(alarm.pending).toEqual([50])
+    threadDb.exec("DROP TRIGGER reject_deadline_cancellation")
+    await alarm.advanceTo(60)
+
+    const committed = await h.read("caller")
+    const alarmAt = committed.findIndex((event) => event.type === "AlarmFired")
+    const cancellationAt = committed.findIndex((event) => event.type === "CancellationRequested")
+    expect(alarmAt).toBeGreaterThanOrEqual(0)
+    expect(cancellationAt).toBeGreaterThan(alarmAt)
+    expect(committed.some((event) => event.type === "HoldCancelled")).toBe(true)
+    expect(await h.resting()).toBe(true)
+    expect(h.work()).toBe(0)
+    await h.close()
+    threadDb.close()
   })
 
   test("threads names every thread the log holds", async () => {
