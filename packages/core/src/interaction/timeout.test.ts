@@ -14,6 +14,7 @@ import {
 } from "./timeout"
 import { legacyActorMethod } from "../actor/method-compat"
 import { initialMethodStates, reduceMethodStates } from "./state"
+import type { ActorMethods } from "../actor/method"
 import { Schema } from "effect"
 
 const dispatched = (
@@ -30,6 +31,43 @@ const dispatched = (
   deadlineAt,
   at
 })
+
+// One cancellable work method backs the selection and legacy-recovery properties: its invocation
+// runs until a WorkCompleted record settles it, and only a running invocation accepts cancellation.
+const work = legacyActorMethod({
+  input: Schema.String,
+  output: Schema.String,
+  event: ({ invocation, at }) => ({
+    type: "WorkStarted",
+    id: invocation.id,
+    call: { invocation, deadlineAt: 40 },
+    at
+  }),
+  state: (events, invocation) => events.some((event) =>
+    event.type === "WorkCompleted" && String((event as { readonly id?: unknown }).id) === invocation.id
+  ) ? { status: "completed", output: "done" } : { status: "pending" },
+  cancellation: {
+    state: (events, invocation) => events.some((event) =>
+      event.type === "WorkCompleted" && String((event as { readonly id?: unknown }).id) === invocation.id
+    ) ? "terminal" : "running",
+    event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
+  }
+})
+const workMethods: ActorMethods = { work }
+const startedWork = (id: string, deadlineAt = 40, at = 1): Event => ({
+  type: "WorkStarted",
+  id,
+  call: { invocation: { method: "work", id, epoch: 0 }, deadlineAt },
+  at
+} as Event)
+const deadlineCancellation = (id: string, deadlineAt: number, at: number): Event => ({
+  type: "CancellationRequested",
+  request: `deadline/work/${id}/0/${deadlineAt}`,
+  invocation: { method: "work", id, epoch: 0 },
+  cause: "deadline",
+  deadlineAt,
+  at
+} as Event)
 
 describe("method alarms", () => {
   test("an alarm fact states its schedule and observed firing time", () => {
@@ -58,258 +96,76 @@ describe("method alarms", () => {
       }
     ]
     expect(earliestDeadlineOf(log)).toBe(20)
+    expect(earliestDeadlineOf([startedWork("work-1")], workMethods)).toBe(40)
+    expect(earliestDeadlineOf([startedWork("work-1"), { type: "WorkCompleted", id: "work-1", at: 20 } as Event], workMethods))
+      .toBeUndefined()
   })
 
-  test("an accepted invocation deadline requests method cancellation", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: (events, invocation) => events.some((event) =>
-        event.type === "WorkCompleted" && String((event as { readonly id?: unknown }).id) === invocation.id
-      ) ? { status: "completed", output: "done" } : { status: "pending" },
-      cancellation: {
-        state: () => "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const invocation = { method: "work", id: "work-1", epoch: 0 } as const
-    const log: ReadonlyArray<Event> = [
-      { type: "WorkStarted", id: "work-1", call: { invocation, deadlineAt: 40 }, at: 1 } as Event,
-      { type: "AlarmFired", scheduledFor: 40, at: 43 } as Event
-    ]
-    expect(earliestDeadlineOf(log.slice(0, 1))).toBe(40)
-    expect(earliestDeadlineOf([
-      log[0]!,
-      { type: "WorkCompleted", id: "work-1", at: 20 } as Event
-    ], { work })).toBeUndefined()
-    const transition = methodDeadlineCancellationDerivation({ work })(log)[0]
-    expect(transition?.kind).toBe("intent")
-    if (transition?.kind !== "intent") return
-    expect(transition.events(transition.input, 43)).toEqual([{
-      type: "CancellationRequested",
-      request: "deadline/work/work-1/0/40",
-      invocation,
-      cause: "deadline",
-      deadlineAt: 40,
-      at: 43
-    }])
-  })
-
-  test("a crossed deadline projects its cancellation at the observed time", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: () => ({ status: "pending" }),
-      cancellation: {
-        state: () => "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const invocation = { method: "work", id: "work-1", epoch: 0 } as const
-    const started = {
-      type: "WorkStarted",
-      id: "work-1",
-      call: { invocation, deadlineAt: 40 },
-      at: 1
-    } as Event
-    expect(deadlineCancellationsAt([started], { work }, 39)).toEqual([])
-    expect(deadlineCancellationsAt([started], { work }, 40)).toEqual([{ invocation, deadlineAt: 40 }])
-    expect(deadlineCancellationEventsAt([started], { work }, 40)).toEqual([{
-      type: "CancellationRequested",
-      request: "deadline/work/work-1/0/40",
-      invocation,
-      cause: "deadline",
-      deadlineAt: 40,
-      at: 40
-    }])
-  })
-
-  test("one crossing projects every crossed invocation", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: () => ({ status: "pending" }),
-      cancellation: {
-        state: () => "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const first = { method: "work", id: "work-1", epoch: 0 } as const
-    const second = { method: "work", id: "work-2", epoch: 0 } as const
-    const started = (invocation: { readonly method: "work"; readonly id: string; readonly epoch: 0 }, deadlineAt: number) => ({
-      type: "WorkStarted",
-      id: invocation.id,
-      call: { invocation, deadlineAt },
-      at: 1
-    } as Event)
-    const log = [started(first, 40), started(second, 45)]
-    expect(deadlineCancellationEventsAt(log, { work }, 44)).toEqual([{
-      type: "CancellationRequested",
-      request: "deadline/work/work-1/0/40",
-      invocation: first,
-      cause: "deadline",
-      deadlineAt: 40,
-      at: 44
-    }])
-    expect(deadlineCancellationEventsAt(log, { work }, 50)).toEqual([
+  test("cancellation selection projects one cancellation from an eligible invocation", () => {
+    const completed = { type: "WorkCompleted", id: "work-1", at: 20 } as Event
+    const cases: ReadonlyArray<{
+      readonly name: string
+      readonly log: ReadonlyArray<Event>
+      readonly at: number
+      readonly expected: ReadonlyArray<Event>
+      readonly methods?: ActorMethods
+    }> = [
       {
-        type: "CancellationRequested",
-        request: "deadline/work/work-1/0/40",
-        invocation: first,
-        cause: "deadline",
-        deadlineAt: 40,
-        at: 50
+        name: "overdue, running, and cancellable",
+        log: [startedWork("work-1")],
+        at: 40,
+        expected: [deadlineCancellation("work-1", 40, 40)]
       },
+      { name: "deadline still in the future", log: [startedWork("work-1")], at: 39, expected: [] },
+      { name: "already settled", log: [startedWork("work-1"), completed], at: 41, expected: [] },
       {
-        type: "CancellationRequested",
-        request: "deadline/work/work-2/0/45",
-        invocation: second,
-        cause: "deadline",
-        deadlineAt: 45,
-        at: 50
+        name: "cancellation already requested",
+        log: [startedWork("work-1"), deadlineCancellation("work-1", 40, 40)],
+        at: 41,
+        expected: []
+      },
+      { name: "method does not support cancellation", log: [startedWork("work-1")], methods: {}, at: 41, expected: [] },
+      {
+        name: "every crossed invocation",
+        log: [startedWork("work-1"), startedWork("work-2", 45)],
+        at: 50,
+        expected: [deadlineCancellation("work-1", 40, 50), deadlineCancellation("work-2", 45, 50)]
       }
+    ]
+    expect(deadlineCancellationsAt([startedWork("work-1")], workMethods, 40)).toEqual([
+      { invocation: { method: "work", id: "work-1", epoch: 0 }, deadlineAt: 40 }
     ])
+    for (const current of cases) {
+      expect(deadlineCancellationEventsAt(current.log, current.methods ?? workMethods, current.at), current.name)
+        .toEqual(current.expected)
+    }
   })
 
-  test("a settled or terminal deadline projects no cancellation", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: (events, invocation) => events.some((event) =>
-        event.type === "WorkCompleted" && String((event as { readonly id?: unknown }).id) === invocation.id
-      ) ? { status: "completed", output: "done" } : { status: "pending" },
-      cancellation: {
-        state: (events, invocation) => events.some((event) =>
-          event.type === "WorkCompleted" && String((event as { readonly id?: unknown }).id) === invocation.id
-        ) ? "terminal" : "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const invocation = { method: "work", id: "work-1", epoch: 0 } as const
-    const started = {
-      type: "WorkStarted",
-      id: "work-1",
-      call: { invocation, deadlineAt: 40 },
-      at: 1
-    } as Event
-    const requested = [{
-      type: "CancellationRequested",
-      request: "deadline/work/work-1/0/40",
-      invocation,
-      cause: "deadline",
-      deadlineAt: 40,
-      at: 40
-    } as Event]
-    expect(deadlineCancellationEventsAt([started, ...requested], { work }, 41)).toEqual([])
-    const completed = [{ type: "WorkCompleted", id: "work-1", at: 20 } as Event]
-    expect(deadlineCancellationEventsAt([started, ...completed], { work }, 41)).toEqual([])
-    expect(deadlineCancellationEventsAt([started], {}, 41)).toEqual([])
-  })
-
-  test("a crossed deadline projects its cancellation before and after commit", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: () => ({ status: "pending" }),
-      cancellation: {
-        state: () => "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const invocation = { method: "work", id: "work-1", epoch: 0 } as const
-    const started = {
-      type: "WorkStarted",
-      id: "work-1",
-      call: { invocation, deadlineAt: 40 },
-      at: 1
-    } as Event
-    const alarmed = [started, alarmFired({ scheduledFor: 40, at: 43 })]
-    const transition = methodDeadlineCancellationDerivation({ work })(alarmed)[0]
-    expect(transition?.kind).toBe("intent")
-    if (transition?.kind !== "intent") return
-    expect(transition.events(transition.input, 43)).toEqual([{
-      type: "CancellationRequested",
-      request: "deadline/work/work-1/0/40",
-      invocation,
-      cause: "deadline",
-      deadlineAt: 40,
-      at: 43
-    }])
-    const committed = [...alarmed, ...deadlineCancellationEventsAt(alarmed, { work }, 43)]
-    expect(methodDeadlineCancellationDerivation({ work })(committed)).toEqual([])
-    expect(deadlineCancellationEventsAt(committed, { work }, 44)).toEqual([])
-  })
-
-  test("two alarms crossing one deadline project one cancellation", () => {
-    const work = legacyActorMethod({
-      input: Schema.String,
-      output: Schema.String,
-      event: ({ invocation, at }) => ({
-        type: "WorkStarted",
-        id: invocation.id,
-        call: { invocation, deadlineAt: 40 },
-        at
-      }),
-      state: () => ({ status: "pending" }),
-      cancellation: {
-        state: () => "running",
-        event: (request, at) => ({ type: "WorkCancelled", id: request.invocation.id, at })
-      }
-    })
-    const invocation = { method: "work", id: "work-1", epoch: 0 } as const
-    const started = {
-      type: "WorkStarted",
-      id: "work-1",
-      call: { invocation, deadlineAt: 40 },
-      at: 1
-    } as Event
+  test("legacy recovery derives an alarm's missing cancellation exactly once", () => {
     const log = [
-      started,
+      startedWork("work-1"),
       alarmFired({ scheduledFor: 40, at: 43 }),
       alarmFired({ scheduledFor: 40, at: 50 })
     ]
-    const complete = methodDeadlineCancellationDerivation({ work })(log)
+    const complete = methodDeadlineCancellationDerivation(workMethods)(log)
     expect(complete).toHaveLength(1)
     expect(complete.map((transition) => transition.key))
-      .toEqual([`cx:${JSON.stringify([invocation.method, invocation.id, invocation.epoch])}`])
-    let methodStates = initialMethodStates({ work })
+      .toEqual([`cx:${JSON.stringify(["work", "work-1", 0])}`])
+    const transition = complete[0]
+    expect(transition?.kind).toBe("intent")
+    if (transition?.kind !== "intent") return
+    expect(transition.events(transition.input, 50)).toEqual([deadlineCancellation("work-1", 40, 50)])
+    let methodStates = initialMethodStates(workMethods)
     let timeoutState = initialMethodTimeoutState()
     for (const event of log) {
-      methodStates = reduceMethodStates({ work }, methodStates, event)
+      methodStates = reduceMethodStates(workMethods, methodStates, event)
       timeoutState = reduceMethodTimeoutState(timeoutState, event)
     }
-    expect(methodTimeoutTransitions({ work }, methodStates, timeoutState).map((transition) => transition.key))
+    expect(methodTimeoutTransitions(workMethods, methodStates, timeoutState).map((transition) => transition.key))
       .toEqual(complete.map((transition) => transition.key))
+    const committed = [...log, ...deadlineCancellationEventsAt(log, workMethods, 50)]
+    expect(methodDeadlineCancellationDerivation(workMethods)(committed)).toEqual([])
+    expect(deadlineCancellationEventsAt(committed, workMethods, 51)).toEqual([])
   })
 
   test("an alarm crossing produces one caller timeout without reading a clock", () => {
