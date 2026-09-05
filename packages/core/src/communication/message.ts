@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import type { Event } from "@clavia/tardigrade-core/event"
-import type { KeyFragment } from "../log"
+import type { KeyFragment, SubjectFragment } from "../log"
 
 // MessageReceived is the canonical inbound: an agent's turn, a mailbox's sink, a worker's brief, and a reply coming home are all this event. id is the dedup key everywhere. source names the arriving connection; chat and sender are provider coordinates; from is the delivering actor's address; input is a run's instance input; data is the provider's structured record. sender and from are separate namespaces on purpose: sender authored the message in the world, from delivered it here, receivers route by from and criteria match sender, so neither can impersonate the other.
 export const MessageReceived = Schema.Struct({
@@ -52,6 +52,30 @@ export const replyId = (id: string): string => `${id}${REPLY_SUFFIX}`
 // boundaryId identifies one reported boundary of a turn. Round zero preserves the ordinary reply convention.
 export const boundaryId = (turn: string, round: number): string =>
   round === 0 ? replyId(turn) : `${replyId(turn)}.${round}`
+
+// replySubjectOf derives the outbound id a reply id answers: `X.reply` answers X, and a later
+// boundary round `X.reply.N` answers X too, so the subject a reply names is the id it replies to
+// rather than the id it carries (log/subjects.test.ts, "a reply subject names the outbound id it answers").
+const replyIdPattern = new RegExp(`^(.+)${REPLY_SUFFIX.replace(/\./g, "\\.")}(?:\\.(\\d+))?$`)
+export const replySubjectOf = (id: string): string | undefined => {
+  const matched = replyIdPattern.exec(id)
+  return matched === null ? undefined : `reply:${matched[1]!}`
+}
+
+// messageSubjects derives the read-side coordinates of a message: every message by its id, and
+// every reply by the outbound id it answers. The fragment lives beside the reply grammar it reads,
+// the owner of the derivation. A ResponseReceived is a method response whose id follows the same
+// grammar (method/response.ts, boundaryEvent), so one fragment covers both carriers.
+export const messageSubjects: SubjectFragment = {
+  prefixes: ["msg:", "reply:"],
+  subjectOf: (event) => {
+    if (event.type !== "MessageReceived" && event.type !== "ResponseReceived") return undefined
+    const id = String((event as { readonly id?: unknown }).id ?? "")
+    if (id === "") return undefined
+    const reply = replySubjectOf(id)
+    return reply === undefined ? `msg:${id}` : reply
+  }
+}
 
 // boundaryEvent constructs one typed boundary report sent to a caller through a reversed link.
 export const boundaryEvent = (args: {
