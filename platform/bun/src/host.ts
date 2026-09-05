@@ -92,6 +92,11 @@ export interface BunHost {
   readonly seed: (thread: string, events: ReadonlyArray<Event>) => Promise<void>
   readonly read: (thread: string) => Promise<ReadonlyArray<Event>>
   readonly readPage: (thread: string, mark: number, limit: number) => Promise<ReadonlyArray<ThreadEventRow>>
+  readonly head: (thread: string) => Promise<number>
+  // readKey answers the one event a durable key names, and readSubject the latest event a
+  // subject names, each from the index beside the thread's log.
+  readonly readKey: (thread: string, key: string) => Promise<ThreadEventRow | undefined>
+  readonly readSubject: (thread: string, subject: string) => Promise<ThreadEventRow | undefined>
   readonly awaitHead: (thread: string, mark: number, signal?: AbortSignal) => Promise<number>
   readonly readActorPage: (mark: number, limit: number) => Promise<ReadonlyArray<ThreadEventRow>>
   readonly actorThreads: () => Promise<{
@@ -751,6 +756,18 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
     readPage: async (thread, mark, limit) => {
       const threadRuntime = await runtimeOf(thread)
       return threadRuntime.runtime.runPromise(threadRuntime.store.readPage(mark, limit))
+    },
+    head: async (thread) => {
+      const threadRuntime = await runtimeOf(thread)
+      return threadRuntime.runtime.runPromise(threadRuntime.store.head)
+    },
+    readKey: async (thread, key) => {
+      const threadRuntime = await runtimeOf(thread)
+      return threadRuntime.runtime.runPromise(threadRuntime.store.readKey(key))
+    },
+    readSubject: async (thread, subject) => {
+      const threadRuntime = await runtimeOf(thread)
+      return threadRuntime.runtime.runPromise(threadRuntime.store.readSubject(subject))
     },
     awaitHead: async (thread, mark, signal) => {
       const threadRuntime = await runtimeOf(thread)
