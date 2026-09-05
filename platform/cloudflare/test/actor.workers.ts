@@ -530,7 +530,8 @@ describe("cloudflare actor", () => {
       tables: ["effect_sql_migrations"],
       entries: [
         { migration_id: 1, name: "thread_identity" },
-        { migration_id: 2, name: "thread_events" }
+        { migration_id: 2, name: "thread_events" },
+        { migration_id: 3, name: "thread_subjects" }
       ]
     })
   }, WORKER_INTEGRATION_TIMEOUT_MILLIS)
@@ -604,6 +605,80 @@ describe("cloudflare actor", () => {
     )
     expect((await indexed.json() as ReadonlyArray<{ readonly event: { readonly secretId: string } }>).map((row) => row.event.secretId))
       .toEqual(["first-secret", "second-secret"])
+  })
+
+  test("a fact read answers over the API without paging the log", async () => {
+    await createThread("fact-reads")
+    const append = async (id: string, text: string) => {
+      const response = await SELF.fetch("http://test/v1/actors/main/threads/fact-reads/events", {
+        method: "POST",
+        headers: { ...authorization, "content-type": "application/json" },
+        body: JSON.stringify({ type: "MessageReceived", id, text })
+      })
+      expect(response.status).toBe(202)
+    }
+    const fact = async (query: string): Promise<{ readonly status: number; readonly body: unknown }> => {
+      const response = await SELF.fetch(`http://test/v1/actors/main/threads/fact-reads/fact?${query}`, {
+        headers: authorization
+      })
+      return { status: response.status, body: await response.json() }
+    }
+    await append("brief", "hello")
+    const created = await fact("key=thread%3Acreated")
+    expect(created.status).toBe(200)
+    expect(created.body).toMatchObject({ seq: 1, event: { type: "ThreadCreated" } })
+    const brief = await fact("subject=msg%3Abrief")
+    expect(brief.status).toBe(200)
+    expect(brief.body).toMatchObject({ event: { type: "MessageReceived", id: "brief", text: "hello" } })
+    // A later boundary round wins the reply subject, so a receipt refresh reads the newest fact.
+    await append("out-1.reply", "first")
+    await append("out-1.reply.2", "retry")
+    const reply = await fact("subject=reply%3Aout-1")
+    expect(reply.status).toBe(200)
+    expect(reply.body).toMatchObject({ event: { id: "out-1.reply.2", text: "retry" } })
+    const absent = await fact("subject=reply%3Anever-sent")
+    expect(absent.status).toBe(404)
+    expect(absent.body).toEqual({ error: "unknown fact" })
+    const both = await fact("key=thread%3Acreated&subject=msg%3Abrief")
+    expect(both.status).toBe(400)
+    const neither = await fact("")
+    expect(neither.status).toBe(400)
+    const unknown = await SELF.fetch("http://test/v1/actors/main/threads/ghost/fact?subject=msg%3Abrief", {
+      headers: authorization
+    })
+    expect(unknown.status).toBe(404)
+    expect(await unknown.json()).toEqual({ error: "unknown thread" })
+  })
+
+  test("a sealed deployment answers fact reads and keeps its coordinates opaque", async () => {
+    const prompt = "classified fact brief"
+    const appended = await SELF.fetch("http://test/v1/actors/main/threads/sealed/events", {
+      method: "POST",
+      headers: { ...authorization, "content-type": "application/json" },
+      body: JSON.stringify({ type: "MessageReceived", id: "classified-facts-brief", text: prompt })
+    })
+    expect(appended.status).toBe(202)
+    const bySubject = await SELF.fetch("http://test/v1/actors/main/threads/sealed/fact?subject=msg%3Aclassified-facts-brief", {
+      headers: authorization
+    })
+    expect(bySubject.status).toBe(200)
+    expect(await bySubject.json()).toMatchObject({
+      event: { type: "MessageReceived", id: "classified-facts-brief", text: prompt }
+    })
+    const byKey = await SELF.fetch("http://test/v1/actors/main/threads/sealed/fact?key=thread%3Acreated", {
+      headers: authorization
+    })
+    expect(byKey.status).toBe(200)
+    expect(await byKey.json()).toMatchObject({ seq: 1, event: { type: "ThreadCreated" } })
+    const raw = await runInDurableObject(threadStub("sealed"), (_instance, state) =>
+      state.storage.sql.exec<{ readonly subject: string; readonly event: string }>(
+        "SELECT subject, event FROM event_subjects"
+      ).toArray()
+    )
+    expect(raw.length).toBeGreaterThan(0)
+    expect(raw.every((row) => /^hmac-sha256:[a-f0-9]{64}$/.test(row.subject))).toBe(true)
+    expect(raw.every((row) => !row.subject.includes("classified") && !row.subject.includes("brief"))).toBe(true)
+    expect(raw.every((row) => !row.event.includes(prompt))).toBe(true)
   })
 
   test("opaque child addresses execute and round-trip through the public API", async () => {

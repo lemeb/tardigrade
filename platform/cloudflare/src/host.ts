@@ -5,10 +5,11 @@ import type { Event } from "@clavia/tardigrade-core/log/event"
 import { EventLog, eventLogFrom, type ThreadEventRow } from "@clavia/tardigrade-core/log"
 import { mappedDirectory } from "@clavia/tardigrade-core/communication/directory"
 import { Router, directoryRoute, sendThrough, type TransportRoute } from "@clavia/tardigrade-core/communication/router"
-import type { Transport } from "@clavia/tardigrade-core/communication/transport"
-import { isActorEnvelope, isProviderEnvelope, linkedEventOf, type ActorEnvelope, type Envelope } from "@clavia/tardigrade-core/communication/envelope"
+import { messageSubjects } from "@clavia/tardigrade-core/communication/message"
 import { formatThreadAddress, type ThreadAddress, type ProviderEndpoint } from "@clavia/tardigrade-core/communication/endpoint"
+import type { Transport } from "@clavia/tardigrade-core/communication/transport"
 import type { Link } from "@clavia/tardigrade-core/communication/link"
+import { isActorEnvelope, isProviderEnvelope, linkedEventOf, type ActorEnvelope, type Envelope } from "@clavia/tardigrade-core/communication/envelope"
 import {
   alarmFired,
   earliestDeadlineOf,
@@ -48,6 +49,9 @@ export type CloudflareThreadHostOptions<R> = {
   readonly providers?: ReadonlyArray<Provider>
   readonly routes?: ReadonlyArray<TransportRoute>
   readonly keyOf?: (event: Event) => string | undefined
+  // subjectOf extends the read-side subject derivation with the application's own fragments
+  // (composeSubjects), the read-index mirror of keyOf's composition.
+  readonly subjectOf?: (event: Event) => string | undefined
   readonly store?: CloudflareThreadStorePolicy
   readonly commitObserver?: CommitObserver
   readonly retainCommitTask?: (task: Promise<void>) => void
@@ -57,6 +61,11 @@ export interface CloudflareThreadHost {
   readonly identity: ThreadAddress
   readonly read: () => Promise<ReadonlyArray<Event>>
   readonly readPage: (mark: number, limit: number) => Promise<ReadonlyArray<ThreadEventRow>>
+  readonly head: () => Promise<number>
+  // readKey answers the one event a durable key names, and readSubject the latest event a
+  // subject names, each from the index beside the thread's log.
+  readonly readKey: (key: string) => Promise<ThreadEventRow | undefined>
+  readonly readSubject: (subject: string) => Promise<ThreadEventRow | undefined>
   readonly commit: (envelope: Envelope<unknown, Event, ThreadAddress>) => Promise<void>
   readonly stage: (envelope: Envelope<unknown, Event, ThreadAddress>) => Promise<void>
   readonly commitRoot: (event: Event) => Promise<void>
@@ -86,7 +95,9 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
   const providerTransport = providerTransportFrom(options.providers ?? [])
   const storeKeyOf = (event: Event): string | undefined =>
     methodIngressKeyOf(event) ?? threadKeys.keyOf(event) ?? options.keyOf?.(event)
-  const events = new CloudflareEventStore(sql, storeKeyOf, options.store?.codec, options.store?.indexKey)
+  const storeSubjectOf = (event: Event): string | undefined =>
+    messageSubjects.subjectOf(event) ?? options.subjectOf?.(event)
+  const events = new CloudflareEventStore(sql, storeKeyOf, options.store?.codec, options.store?.indexKey, storeSubjectOf)
   const interruptions = effectInterruptionRegistry()
   await Effect.runPromise(events.initialize())
   const sync = Effect.promise(() => options.storage.sync())
@@ -231,6 +242,9 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
     identity,
     read: () => Effect.runPromise(events.read),
     readPage: (mark, limit) => Effect.runPromise(events.readPage(mark, limit)),
+    head: () => Effect.runPromise(events.head),
+    readKey: (key) => Effect.runPromise(events.readKey(key)),
+    readSubject: (subject) => Effect.runPromise(events.readSubject(subject)),
     commit: (envelope) => Effect.runPromise(commitEffect(envelope.link.target, envelope.event, envelope.lineage, envelope.link, envelope.call)),
     stage: (envelope) => Effect.runPromise(commitEffect(envelope.link.target, envelope.event, envelope.lineage, envelope.link, envelope.call, false)),
     commitRoot: (event) => Effect.runPromise(commitEffect(identity, event, undefined)),

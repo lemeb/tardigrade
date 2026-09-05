@@ -711,6 +711,13 @@ export class ActorDO extends DurableObject<Env> {
   }
 }
 
+// ThreadFactAnswer is the fact RPC's answer as the route reads it: the head the row was read at,
+// and the row itself, null when no event answers the coordinate (ThreadDO.fact).
+interface ThreadFactAnswer {
+  readonly head: number
+  readonly row: { readonly seq: number; readonly event: Event } | null
+}
+
 // ThreadDO runs one thread over one SQLite-backed Durable Object.
 export class ThreadDO extends DurableObject<Env> {
   private schema: Promise<void> | undefined
@@ -1063,6 +1070,22 @@ export class ThreadDO extends DurableObject<Env> {
       if (rows.length < query.limit) break
     }
     return selected
+  }
+
+  async fact(thread: string, query: { readonly key?: string; readonly subject?: string }): Promise<ThreadFactAnswer> {
+    const ownedThread = this.thread()
+    if (ownedThread !== thread) {
+      throw new Error("request thread does not match the Thread DO identity")
+    }
+    if ((query.key === undefined) === (query.subject === undefined)) {
+      throw new Error("a fact query names exactly one coordinate: key or subject")
+    }
+    const host = await this.host()
+    const head = await host.head()
+    const row = query.key !== undefined
+      ? await host.readKey(query.key)
+      : await host.readSubject(query.subject ?? "")
+    return { head, row: row === undefined ? null : row }
   }
 
   async status(): Promise<{ readonly status: "resting" | "driving"; readonly dirty: number }> {
@@ -1441,6 +1464,36 @@ const routes = [
       }).pipe(Effect.match({
         onFailure: (error) => json({ error }, 500),
         onSuccess: (rows) => json(rows)
+      }))
+    })
+  )),
+  HttpRouter.route("GET", "/v1/actors/:id/threads/:thread/fact", protectedRoute((request, env) =>
+    Effect.gen(function* () {
+      const params = yield* HttpRouter.params
+      const instance = params.id ?? ""
+      const thread = params.thread ?? ""
+      if (!Schema.is(ActorInstanceId)(instance)) return json({ error: "invalid actor instance id" }, 400)
+      const stub = yield* Effect.promise(() => threadStub(env, deployedActor, instance, thread))
+      if (stub === undefined) return json({ error: "unknown thread" }, 404)
+      const url = new URL(request.url, "http://worker")
+      const key = url.searchParams.get("key")
+      const subject = url.searchParams.get("subject")
+      if ((key === null) === (subject === null)) {
+        return json({ error: "a fact query names exactly one coordinate: key or subject" }, 400)
+      }
+      return yield* Effect.tryPromise({
+        try: () => stub.stub.fact(stub.thread, {
+          ...(key === null ? {} : { key }),
+          ...(subject === null ? {} : { subject })
+        }) as Promise<ThreadFactAnswer>,
+        catch: (cause) => cause instanceof Error ? cause.message : String(cause)
+      }).pipe(Effect.match({
+        onFailure: (error) => json({ error }, 500),
+        onSuccess: (resolved) => resolved.head === 0
+          ? json({ error: "unknown thread" }, 404)
+          : resolved.row === null
+            ? json({ error: "unknown fact" }, 404)
+            : json(resolved.row)
       }))
     })
   )),
