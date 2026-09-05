@@ -28,6 +28,9 @@ export const withLegacyThreadIds = (threads: ActorThreads): ActorThreads => {
     events: (id) => Effect.flatMap(resolve(id), threads.events),
     eventsPage: (id, mark, limit) => Effect.flatMap(resolve(id), (thread) => threads.eventsPage(thread, mark, limit)),
     awaitHead: (id, mark) => Effect.flatMap(resolve(id), (thread) => threads.awaitHead(thread, mark)),
+    head: (id) => Effect.flatMap(resolve(id), threads.head),
+    readKey: (id, key) => Effect.flatMap(resolve(id), (thread) => threads.readKey(thread, key)),
+    readSubject: (id, subject) => Effect.flatMap(resolve(id), (thread) => threads.readSubject(thread, subject)),
     list: Effect.map(threads.list, (entries) => {
       const names = new Set<string>()
       return entries.map(({ id: thread, events }) => {

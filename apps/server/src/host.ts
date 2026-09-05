@@ -88,6 +88,11 @@ export interface ActorThreads {
   readonly events: (id: string) => Effect.Effect<ReadonlyArray<Event>>
   readonly eventsPage: (id: string, mark: number, limit: number) => Effect.Effect<ReadonlyArray<ThreadEventRow>>
   readonly awaitHead: (id: string, mark: number) => Effect.Effect<number>
+  readonly head: (id: string) => Effect.Effect<number>
+  // readKey answers the one event a durable key names, and readSubject the latest event a
+  // subject names, each from the index beside the log rather than the log itself.
+  readonly readKey: (id: string, key: string) => Effect.Effect<ThreadEventRow | undefined>
+  readonly readSubject: (id: string, subject: string) => Effect.Effect<ThreadEventRow | undefined>
   readonly actorEventsPage: (mark: number, limit: number) => Effect.Effect<ReadonlyArray<ThreadEventRow>>
   readonly actorThreads: Effect.Effect<{
     readonly cursor: number
@@ -114,6 +119,9 @@ export class Threads extends Context.Service<
     readonly instance: (id: string) => Effect.Effect<ActorThreads | undefined>
     readonly append: (actor: string, thread: string, event: Event) => Effect.Effect<void>
     readonly events: (actor: string, thread: string) => Effect.Effect<ReadonlyArray<Event>>
+    readonly head: (actor: string, thread: string) => Effect.Effect<number>
+    readonly readKey: (actor: string, thread: string, key: string) => Effect.Effect<ThreadEventRow | undefined>
+    readonly readSubject: (actor: string, thread: string, subject: string) => Effect.Effect<ThreadEventRow | undefined>
     readonly list: (actor: string) => ActorThreads["list"]
     readonly settled: (actor: string) => Effect.Effect<void>
     readonly definitions?: Effect.Effect<ReadonlyArray<ActorSummary>>
@@ -451,10 +459,12 @@ const runtimeOf = async <R>(
       })
     )
   )
-  await host.recover()
   const read = (id: string) => Effect.promise(() => host.read(id))
   const readPage = (id: string, mark: number, limit: number) =>
     Effect.promise(() => host.readPage(id, mark, limit))
+  const head = (id: string) => Effect.promise(() => host.head(id))
+  const readKey = (id: string, key: string) => Effect.promise(() => host.readKey(id, key))
+  const readSubject = (id: string, subject: string) => Effect.promise(() => host.readSubject(id, subject))
   const awaitHead = (id: string, mark: number) =>
     Effect.promise((signal) => host.awaitHead(id, mark, signal))
   const awaitActorHead = (mark: number) => Effect.promise((signal) => host.awaitActorHead(mark, signal))
@@ -490,6 +500,9 @@ const runtimeOf = async <R>(
     events: read,
     eventsPage: readPage,
     awaitHead,
+    head,
+    readKey,
+    readSubject,
     actorEventsPage: (mark, limit) => Effect.promise(() => host.readActorPage(mark, limit)),
     actorThreads: Effect.promise(() => host.actorThreads()),
     actorThread: (thread) => Effect.promise(() => host.actorThread(thread)),
@@ -610,6 +623,9 @@ export const layerActorThreads = <R>(
       instance: (id) => Effect.succeed(runtimes.get(id)?.threads),
       append: (actor, thread, event) => Effect.flatMap(Effect.promise(() => open(actor)), (runtime) => runtime.threads.append(thread, event)),
       events: (actor, thread) => runtimes.get(actor)?.threads.events(thread) ?? Effect.succeed([]),
+      head: (actor, thread) => runtimes.get(actor)?.threads.head(thread) ?? Effect.succeed(0),
+      readKey: (actor, thread, key) => runtimes.get(actor)?.threads.readKey(thread, key) ?? Effect.succeed(undefined),
+      readSubject: (actor, thread, subject) => runtimes.get(actor)?.threads.readSubject(thread, subject) ?? Effect.succeed(undefined),
       list: (actor) => runtimes.get(actor)?.threads.list ?? Effect.succeed([]),
       settled: (actor) => runtimes.get(actor)?.threads.settled ?? Effect.void
     }
@@ -872,6 +888,9 @@ const make = (options: ThreadsOptions) =>
       instance: (id) => Effect.succeed(instances.get(id)?.threads),
       append: (actor, thread, event) => Effect.flatMap(Effect.promise(() => openInstance(actor)), (runtime) => runtime.threads.append(thread, event)),
       events: (actor, thread) => instances.get(actor)?.threads.events(thread) ?? Effect.succeed([]),
+      head: (actor, thread) => instances.get(actor)?.threads.head(thread) ?? Effect.succeed(0),
+      readKey: (actor, thread, key) => instances.get(actor)?.threads.readKey(thread, key) ?? Effect.succeed(undefined),
+      readSubject: (actor, thread, subject) => instances.get(actor)?.threads.readSubject(thread, subject) ?? Effect.succeed(undefined),
       list: (actor) => instances.get(actor)?.threads.list ?? Effect.succeed([]),
       settled: (actor) => instances.get(actor)?.threads.settled ?? Effect.void,
       definitions: registry.list,

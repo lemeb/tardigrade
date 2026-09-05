@@ -46,6 +46,9 @@ test("the adapter translates public operations while preserving raw directory re
     events: (thread) => capture(thread).pipe(Effect.as([])),
     eventsPage: (thread) => capture(thread).pipe(Effect.as([])),
     awaitHead: (thread) => capture(thread).pipe(Effect.as(0)),
+    head: (thread) => capture(thread).pipe(Effect.as(0)),
+    readKey: (thread) => capture(thread).pipe(Effect.as(undefined)),
+    readSubject: (thread) => capture(thread).pipe(Effect.as(undefined)),
     actorEventsPage: () => Effect.succeed([]),
     actorThreads: Effect.succeed({ cursor: 2, threads: records }),
     actorThread: lookup(...records.map((record) => record.thread)),
@@ -58,8 +61,13 @@ test("the adapter translates public operations while preserving raw directory re
   await Effect.runPromise(api.events("thread_child"))
   await Effect.runPromise(api.eventsPage("root", 0, 10))
   await Effect.runPromise(api.awaitHead("thread_child", 0))
-  expect(received).toEqual(["ag.root", "thread_child", "ag.root", "thread_child"])
-  expect((await Effect.runPromise(api.list)).map((entry) => entry.id)).toEqual(["root", "thread_child"])
+  await Effect.runPromise(api.head("thread_child"))
+  await Effect.runPromise(api.readKey("root", "thread:created"))
+  await Effect.runPromise(api.readSubject("thread_child", "msg:m1"))
+  expect(received).toEqual([
+    "ag.root", "thread_child", "ag.root", "thread_child",
+    "thread_child", "ag.root", "thread_child"
+  ])
   expect(await Effect.runPromise(api.actorThreads)).toEqual({ cursor: 2, threads: records })
   await expect(Effect.runPromise(withLegacyThreadIds({
     ...raw, list: Effect.succeed([{ id: "ag.root", events: [] }, { id: "root", events: [] }])

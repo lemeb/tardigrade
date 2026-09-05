@@ -666,6 +666,9 @@ describe("the event stream", () => {
         waiters.add(wake)
         return Effect.sync(() => { waiters.delete(wake) })
       }),
+      head: () => Effect.succeed(head),
+      readKey: () => Effect.succeed(undefined),
+      readSubject: () => Effect.succeed(undefined),
       actorEventsPage: () => Effect.succeed([]),
       actorThreads: Effect.succeed({ cursor: 0, threads: [] }),
       actorThread: () => Effect.never,
@@ -682,6 +685,9 @@ describe("the event stream", () => {
       instance: (id) => Effect.succeed(id === "main" ? actorThreads : undefined),
       append: () => Effect.void,
       events: () => Effect.succeed(rows.map((row) => row.event)),
+      head: () => Effect.succeed(0),
+      readKey: () => Effect.succeed(undefined),
+      readSubject: () => Effect.succeed(undefined),
       list: () => Effect.succeed([]),
       settled: () => Effect.void
     })
