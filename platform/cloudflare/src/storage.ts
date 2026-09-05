@@ -256,7 +256,7 @@ export class CloudflareEventStore implements ThreadEventStore {
     return this.sql.unsafe<{ readonly seq: number; readonly event: string }>(statement, [sealed]).pipe(
       Effect.flatMap((rows) => {
         const row = rows[0]
-        if (row === undefined) return Effect.succeed(undefined)
+        if (row === undefined) return Effect.succeed(row)
         return this.decode([JSON.parse(row.event) as Event]).pipe(
           Effect.map((events) => ({ seq: Number(row.seq), event: events[0]! }))
         )
@@ -296,7 +296,7 @@ export class CloudflareEventStore implements ThreadEventStore {
       })
       const indexedSubjects = yield* Effect.forEach(events, (event) => {
         const subject = subjectOf(event)
-        return subject === undefined ? Effect.succeed(undefined) : indexKey(subject)
+        return subject === undefined ? Effect.void : indexKey(subject)
       })
       const encoded = yield* codec.encode(events)
       if (encoded.length !== events.length) {

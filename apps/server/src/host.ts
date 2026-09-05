@@ -624,8 +624,8 @@ export const layerActorThreads = <R>(
       append: (actor, thread, event) => Effect.flatMap(Effect.promise(() => open(actor)), (runtime) => runtime.threads.append(thread, event)),
       events: (actor, thread) => runtimes.get(actor)?.threads.events(thread) ?? Effect.succeed([]),
       head: (actor, thread) => runtimes.get(actor)?.threads.head(thread) ?? Effect.succeed(0),
-      readKey: (actor, thread, key) => runtimes.get(actor)?.threads.readKey(thread, key) ?? Effect.succeed(undefined),
-      readSubject: (actor, thread, subject) => runtimes.get(actor)?.threads.readSubject(thread, subject) ?? Effect.succeed(undefined),
+      readKey: (actor, thread, key) => runtimes.get(actor)?.threads.readKey(thread, key) ?? Effect.as(Effect.void, undefined),
+      readSubject: (actor, thread, subject) => runtimes.get(actor)?.threads.readSubject(thread, subject) ?? Effect.as(Effect.void, undefined),
       list: (actor) => runtimes.get(actor)?.threads.list ?? Effect.succeed([]),
       settled: (actor) => runtimes.get(actor)?.threads.settled ?? Effect.void
     }
@@ -889,8 +889,8 @@ const make = (options: ThreadsOptions) =>
       append: (actor, thread, event) => Effect.flatMap(Effect.promise(() => openInstance(actor)), (runtime) => runtime.threads.append(thread, event)),
       events: (actor, thread) => instances.get(actor)?.threads.events(thread) ?? Effect.succeed([]),
       head: (actor, thread) => instances.get(actor)?.threads.head(thread) ?? Effect.succeed(0),
-      readKey: (actor, thread, key) => instances.get(actor)?.threads.readKey(thread, key) ?? Effect.succeed(undefined),
-      readSubject: (actor, thread, subject) => instances.get(actor)?.threads.readSubject(thread, subject) ?? Effect.succeed(undefined),
+      readKey: (actor, thread, key) => instances.get(actor)?.threads.readKey(thread, key) ?? Effect.as(Effect.void, undefined),
+      readSubject: (actor, thread, subject) => instances.get(actor)?.threads.readSubject(thread, subject) ?? Effect.as(Effect.void, undefined),
       list: (actor) => instances.get(actor)?.threads.list ?? Effect.succeed([]),
       settled: (actor) => instances.get(actor)?.threads.settled ?? Effect.void,
       definitions: registry.list,

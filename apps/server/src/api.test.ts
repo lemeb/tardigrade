@@ -706,8 +706,8 @@ describe("the event stream", () => {
         return Effect.sync(() => { waiters.delete(wake) })
       }),
       head: () => Effect.succeed(head),
-      readKey: () => Effect.succeed(undefined),
-      readSubject: () => Effect.succeed(undefined),
+      readKey: () => Effect.as(Effect.void, undefined),
+      readSubject: () => Effect.as(Effect.void, undefined),
       actorEventsPage: () => Effect.succeed([]),
       actorThreads: Effect.succeed({ cursor: 0, threads: [] }),
       actorThread: () => Effect.never,
@@ -725,8 +725,8 @@ describe("the event stream", () => {
       append: () => Effect.void,
       events: () => Effect.succeed(rows.map((row) => row.event)),
       head: () => Effect.succeed(0),
-      readKey: () => Effect.succeed(undefined),
-      readSubject: () => Effect.succeed(undefined),
+      readKey: () => Effect.as(Effect.void, undefined),
+      readSubject: () => Effect.as(Effect.void, undefined),
       list: () => Effect.succeed([]),
       settled: () => Effect.void
     })
