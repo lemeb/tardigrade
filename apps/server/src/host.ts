@@ -476,7 +476,7 @@ const runtimeOf = async <R>(
       const at = yield* Clock.currentTimeMillis
       const stamped = event.at === undefined ? { ...event, at } : event
       return yield* Effect.promise(() =>
-        host.commitRootUnlessKeyPresent(host.self(threadOf(id)), stamped, key)
+        host.commitRootUnlessKeyPresent(host.self(id), stamped, key)
       )
     })
   const commit = (delivery: Envelope) =>
