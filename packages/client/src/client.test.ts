@@ -155,6 +155,35 @@ describe("the address a call goes to", () => {
     expect(url.searchParams.has("limit")).toBe(false)
   })
 
+
+  test("a fact read goes to its thread with exactly the stated coordinate", async () => {
+    answer = () => new Response(JSON.stringify({ seq: 1, event: { type: "ThreadCreated" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    })
+    const client = makeActorClient({ baseUrl: "http://localhost:4111", fetch: stub })
+    const byKey = await client.fact("main", "root", { key: "thread:created" })
+    expect(lastUrl().pathname).toBe("/v1/actors/main/threads/root/fact")
+    expect(lastUrl().searchParams.get("key")).toBe("thread:created")
+    expect(lastUrl().searchParams.has("subject")).toBe(false)
+    await client.fact("main", "root", { subject: "reply:out-1" })
+    expect(lastUrl().searchParams.get("subject")).toBe("reply:out-1")
+    expect(lastUrl().searchParams.has("key")).toBe(false)
+    expect(byKey).toEqual({ seq: 1, event: { type: "ThreadCreated" } })
+  })
+
+  test("an absent fact rejects with the unknown-fact problem", async () => {
+    answer = problemAnswer(404, {
+      type: `${PROBLEM_TYPE_BASE}unknown-fact`,
+      title: "Unknown Fact",
+      status: 404,
+      detail: "No event in this thread's log answers the subject \"reply:never\"."
+    })
+    const failed = await makeActorClient({ baseUrl: "http://localhost:4111", fetch: stub })
+      .fact("main", "root", { subject: "reply:never" })
+      .then(() => undefined, (failure) => failure)
+    expect(failed).toBeInstanceOf(ProblemError)
+  })
   test("a base with a trailing slash does not double it", async () => {
     await makeActorClient({ baseUrl: "http://127.0.0.1:4111/" , fetch: stub }).list("main")
     expect(calls[0]!.url).toBe("http://127.0.0.1:4111/v1/actors/main/threads")

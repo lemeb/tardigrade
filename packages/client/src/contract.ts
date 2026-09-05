@@ -68,6 +68,9 @@ export const UnknownMethod = problemKind("unknown-method", "Unknown Method", 404
 // UnknownMethodCall reports a call id the selected method cannot derive from the thread log.
 export const UnknownMethodCall = problemKind("unknown-method-call", "Unknown Method Call", 404)
 
+// UnknownFact reports a durable coordinate no event in the log answers (apps/server/src/api.test.ts, "a fact read answers its row or the coordinate's 404").
+export const UnknownFact = problemKind("unknown-fact", "Unknown Fact", 404)
+
 // ModelCatalogUnavailable reports an unavailable public model catalog.
 export const ModelCatalogUnavailable = problemKind("model-catalog-unavailable", "Model Catalog Unavailable", 503)
 
@@ -475,6 +478,14 @@ export const threadsGroup = HttpApiGroup.make("threads").add(
     query: { after: SeqQuery, limit: SeqQuery, types: Schema.optionalKey(Schema.String) },
     success: Schema.Array(EventRow),
     error: [UnknownActor.schema, UnknownThread.schema]
+  }),
+  // fact reads one exact durable fact by its coordinate: exactly one of a key the store
+  // deduplicates on or a subject whose latest occurrence answers (contract.ts, EventRow).
+  HttpApiEndpoint.get("fact", "/v1/actors/:id/threads/:thread/fact", {
+    params: RuntimeThreadParams,
+    query: { key: Schema.optionalKey(Schema.String), subject: Schema.optionalKey(Schema.String) },
+    success: EventRow,
+    error: [UnknownActor.schema, UnknownThread.schema, UnknownFact.schema]
   }),
   HttpApiEndpoint.get("tree", "/v1/actors/:id/threads/:thread/tree", {
     params: RuntimeThreadParams,

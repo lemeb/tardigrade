@@ -624,6 +624,45 @@ describe("events", () => {
     expect(answers.type).toContain(PROBLEM_CONTENT_TYPE)
     expect(answers.body).toMatchObject({ status: 404, title: "Unknown Thread" })
   })
+
+  test("a fact read answers its row or the coordinate's 404", async () => {
+    const answers = await serving(async (base) => {
+      await birth(base, "alpha", { id: "brief", text: "hello" })
+      await post(base, "/v1/actors/main/threads/alpha/events", {
+        type: "MessageReceived",
+        id: "out-1.reply",
+        text: "done"
+      })
+      const read = async (query: string) => {
+        const response = await fetch(`${base}/v1/actors/main/threads/alpha/fact?${query}`)
+        return { status: response.status, body: await response.json() as Record<string, unknown> }
+      }
+      const ghost = await fetch(`${base}/v1/actors/main/threads/ghost/fact?subject=msg%3Abrief`)
+      return {
+        byKey: await read("key=thread%3Acreated"),
+        bySubject: await read("subject=msg%3Abrief"),
+        latestReply: await read("subject=reply%3Aout-1"),
+        absent: await read("subject=reply%3Anever-sent"),
+        both: await read("key=thread%3Acreated&subject=msg%3Abrief"),
+        neither: await read(""),
+        unknownThread: {
+          status: ghost.status,
+          body: await ghost.json() as Record<string, unknown>
+        }
+      }
+    })
+    expect(answers.byKey.status).toBe(200)
+    expect(answers.byKey.body).toMatchObject({ seq: 1, event: { type: "ThreadCreated" } })
+    expect(answers.bySubject.status).toBe(200)
+    expect(answers.bySubject.body).toMatchObject({ seq: 2, event: { type: "MessageReceived", id: "brief" } })
+    expect(answers.latestReply.status).toBe(200)
+    expect(answers.latestReply.body).toMatchObject({ event: { id: "out-1.reply" } })
+    expect(answers.absent.body).toMatchObject({ status: 404, title: "Unknown Fact" })
+    expect(answers.both.status).toBe(400)
+    expect(answers.neither.status).toBe(400)
+    expect(answers.unknownThread.status).toBe(404)
+    expect(answers.unknownThread.body).toMatchObject({ status: 404, title: "Unknown Thread" })
+  })
 })
 
 // framesOf parses an SSE byte stream into the pairs a client acts on. It is deliberately literal:

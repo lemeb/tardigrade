@@ -104,9 +104,17 @@ export interface ActorClientOptions<P extends Projections = {}, M extends ActorM
 export interface EventsOptions {
   // The seq to read past. The server numbers events from 1, so `after: 40` starts at 41.
   readonly after?: number | undefined
+  // The page size to request.
   readonly limit?: number | undefined
   // Event type names, sent as one comma-joined `types` param.
   readonly types?: ReadonlyArray<string> | undefined
+}
+
+// FactCoordinate names one durable fact: a key the store deduplicates on, or a subject whose
+// latest occurrence answers (contract.ts, threadsGroup "fact"). Exactly one is stated.
+export interface FactCoordinate {
+  readonly key?: string | undefined
+  readonly subject?: string | undefined
 }
 
 export interface CatalogPageOptions {
@@ -184,6 +192,10 @@ export interface ActorClient<P extends Projections = {}, M extends ActorMethods 
   readonly list: (actor: string) => Promise<ReadonlyArray<ThreadSummary>>
   readonly tree: (actor: string, thread: string) => Promise<ThreadNode>
   readonly events: (actor: string, thread: string, options?: EventsOptions) => Promise<ReadonlyArray<EventRow>>
+  // fact reads one exact durable fact by its coordinate, in time proportional to the answer.
+  // An absent coordinate rejects with the unknown-fact problem, the shape methodState already
+  // taught callers (contract.ts, UnknownFact).
+  readonly fact: (actor: string, thread: string, coordinate: FactCoordinate) => Promise<EventRow>
   // Appends one event to a thread's log. A brief is `{ type: "MessageReceived", id, text }`; the
   // platform requires nothing but `type` (contract.ts, Append).
   readonly append: (actor: string, thread: string, event: Append) => Promise<Accepted>
@@ -294,6 +306,13 @@ const eventsQuery = (options: EventsOptions) => {
   return query
 }
 
+const factQuery = (coordinate: FactCoordinate) => {
+  const query: { key?: string; subject?: string } = {}
+  if (coordinate.key !== undefined) query.key = coordinate.key
+  if (coordinate.subject !== undefined) query.subject = coordinate.subject
+  return query
+}
+
 const catalogQuery = (options: ModelPageOptions) => {
   const query: { availability?: CatalogAvailabilityFilter; cursor?: string; limit?: number; provider?: string; search?: string; sort?: ModelCatalogPriceSort; order?: ModelCatalogSortOrder; unpriced?: ModelCatalogUnpricedOrder } = {}
   if (options.availability !== undefined) query.availability = options.availability
@@ -377,6 +396,8 @@ export const makeActorClient = <const P extends Projections = {}, const M extend
       run(api.threads.events({ params: { id: actor, thread }, query: eventsQuery(events) })),
     append,
     methods: () => run(api.methods.methods({})),
+    fact: (actor, thread, coordinate) =>
+      run(api.threads.fact({ params: { id: actor, thread }, query: factQuery(coordinate) })),
     call: async (actor, thread, name, call) => {
       const accepted = await run(api.methods.invoke({
         params: { id: actor, thread, method: name, call: call.id },
