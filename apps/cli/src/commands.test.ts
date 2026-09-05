@@ -125,6 +125,7 @@ const clientOf = (
       recorded.asked.push({ thread, options })
       return answers.fail === undefined ? Promise.resolve(answers.events ?? []) : Promise.reject(answers.fail)
     },
+    fact: () => Promise.reject(new Error("the CLI never reads facts")),
     methodState: state,
     state: (invocation) => {
       recorded.stateRefs.push(invocation)
