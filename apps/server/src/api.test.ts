@@ -115,8 +115,14 @@ const catalog: ModelCatalog = {
 const catalogLayer = layerModelCatalogValue(catalog)
 const inference = makeInferenceStream()
 
+// The listener binds the exact address the client dials. A gate run binds and releases hundreds of
+// ephemeral ports across its parallel tasks, and Bun's default listener is not this address, so
+// another process can hold the same port number through the wildcard or the other address family
+// and answer a request meant for this server: a 404 from a server that never saw the append, or a
+// reset socket, is a port collision, not this app's answer (dev.ts, DEV_HOST, is the production
+// convention).
 const app = Layer.provideMerge(serve({ disableLogger: true, disableListenLog: true, api: { inference } }), [
-  BunHttpServer.layer({ port: 0 }),
+  BunHttpServer.layer({ port: 0, hostname: "127.0.0.1" }),
   config,
   catalogLayer,
   Layer.provide(layerThreads({ infer: layerScripted }), [config, catalogLayer])
@@ -528,7 +534,7 @@ describe("actors", () => {
     }))
     const isolatedCatalog = layerModelCatalogValue(catalog)
     const isolatedApp = Layer.provideMerge(serve({ disableLogger: true, disableListenLog: true }), [
-      BunHttpServer.layer({ port: 0 }),
+      BunHttpServer.layer({ port: 0, hostname: "127.0.0.1" }),
       isolatedConfig,
       isolatedCatalog,
       Layer.provide(layerThreads({ infer: layerScripted }), [isolatedConfig, isolatedCatalog])
@@ -690,7 +696,7 @@ describe("the event stream", () => {
       disableLogger: true,
       disableListenLog: true,
       api: { heartbeat: Duration.millis(10) }
-    }), [BunHttpServer.layer({ port: 0 }), config, catalogLayer, threads, ingress, layerGaugeResting])
+    }), [BunHttpServer.layer({ port: 0, hostname: "127.0.0.1" }), config, catalogLayer, threads, ingress, layerGaugeResting])
 
     const verify = async (port: number) => {
       const abort = new AbortController()
