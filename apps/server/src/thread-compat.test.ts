@@ -43,6 +43,7 @@ test("the adapter translates public operations while preserving raw directory re
   const raw: ActorThreads = {
     methods: {}, sqlite: ":memory:",
     append: (thread) => capture(thread),
+    appendUnlessKeyPresent: (thread) => capture(thread).pipe(Effect.as(true)),
     events: (thread) => capture(thread).pipe(Effect.as([])),
     eventsPage: (thread) => capture(thread).pipe(Effect.as([])),
     awaitHead: (thread) => capture(thread).pipe(Effect.as(0)),
@@ -54,11 +55,12 @@ test("the adapter translates public operations while preserving raw directory re
     settled: Effect.void
   }
   const api = withLegacyThreadIds(raw)
+  await Effect.runPromise(api.appendUnlessKeyPresent("root", { type: "MethodSealed", at: 0 }, "mseal:message"))
   await Effect.runPromise(api.append("root", { type: "MessageReceived" }))
   await Effect.runPromise(api.events("thread_child"))
   await Effect.runPromise(api.eventsPage("root", 0, 10))
   await Effect.runPromise(api.awaitHead("thread_child", 0))
-  expect(received).toEqual(["ag.root", "thread_child", "ag.root", "thread_child"])
+  expect(received).toEqual(["ag.root", "ag.root", "thread_child", "ag.root", "thread_child"])
   expect((await Effect.runPromise(api.list)).map((entry) => entry.id)).toEqual(["root", "thread_child"])
   expect(await Effect.runPromise(api.actorThreads)).toEqual({ cursor: 2, threads: records })
   await expect(Effect.runPromise(withLegacyThreadIds({
