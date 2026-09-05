@@ -176,7 +176,9 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
     read: events.read,
     head: events.head,
     readFrom: (mark: number) => events.readFrom(mark),
-    readPage: (mark: number, limit: number) => events.readPage(mark, limit)
+    readPage: (mark: number, limit: number) => events.readPage(mark, limit),
+    readKey: (key: string) => events.readKey(key),
+    readSubject: (subject: string) => events.readSubject(subject)
   }
   const ports = Layer.mergeAll(
     Layer.succeed(EventLog, eventLogFrom(store)),

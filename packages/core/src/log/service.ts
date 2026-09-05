@@ -21,7 +21,9 @@ export interface AppendResult {
  *     ├── read                 read the complete log
  *     ├── head                 read the latest durable sequence
  *     ├── readFrom(mark)       read the event tail after a mark
- *     └── readPage(mark, size) read a bounded tail with sequence numbers
+ *     ├── readPage(mark, size) read a bounded tail with sequence numbers
+ *     ├── readKey(key)         read the event a durable key names
+ *     └── readSubject(subject) read the latest event a subject names
  */
 export interface ThreadEventStore {
   readonly append: (events: ReadonlyArray<Event>) => Effect.Effect<AppendResult>
@@ -29,7 +31,15 @@ export interface ThreadEventStore {
   readonly head: Effect.Effect<number>
   readonly readFrom: (mark: number) => Effect.Effect<ReadonlyArray<Event>>
   readonly readPage: (mark: number, limit: number) => Effect.Effect<ReadonlyArray<ThreadEventRow>>
+  readonly readKey: (key: string) => Effect.Effect<ThreadEventRow | undefined>
+  readonly readSubject: (subject: string) => Effect.Effect<ThreadEventRow | undefined>
 }
+
+// The exact-fact reads answer one durable fact rather than the history that carries it: readKey
+// returns the one event a dedup key names, and readSubject the latest event that names a subject,
+// each in time proportional to the answer and at the durable head, so a receipt refresh pays for
+// its facts instead of the session (platform/bun/src/host.test.ts, "a receipt's facts answer from
+// the index, never a scan from zero"). History reads keep their cursor paging.
 
 /**
  * EventLog is the runtime port for the immutable event history of one thread.

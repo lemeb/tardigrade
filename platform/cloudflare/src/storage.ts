@@ -3,7 +3,8 @@ import { KeyValueStore } from "effect/unstable/persistence"
 import { SqlClient } from "effect/unstable/sql"
 import { SqliteMigrator } from "@effect/sql-sqlite-do"
 import type { Event } from "@clavia/tardigrade-core/log/event"
-import type { AppendResult, ThreadEventStore } from "@clavia/tardigrade-core/log"
+import { messageSubjects } from "@clavia/tardigrade-core/communication/message"
+import type { AppendResult, ThreadEventRow, ThreadEventStore } from "@clavia/tardigrade-core/log"
 
 export interface EventRow {
   readonly seq: number
@@ -42,6 +43,24 @@ export const hmacSha256EventKeyIndex = (
   return `hmac-sha256:${digest}`
 })
 
+// subjectIndexSchema creates the read-side index beside the log: one row per subject holding the
+// latest event that names it, and one capture row recording the log head the index holds. The
+// subject is sealed by the deployment's index transform at write time, so the table never holds
+// coordinate text a sealed deployment chose to seal (storage.test.ts, "a sealed deployment answers indexed facts").
+const subjectIndexSchema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql.unsafe(`CREATE TABLE event_subjects (
+    subject TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL,
+    event TEXT NOT NULL
+  ) WITHOUT ROWID`)
+  yield* sql.unsafe(`CREATE TABLE event_subjects_capture (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    head INTEGER NOT NULL
+  )`)
+  yield* sql.unsafe("INSERT INTO event_subjects_capture (singleton, head) VALUES (1, 0)")
+})
+
 const actorMigrations = SqliteMigrator.fromRecord({
   "0001_actor_runtime": Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
@@ -57,7 +76,10 @@ const actorMigrations = SqliteMigrator.fromRecord({
       PRIMARY KEY (seq)
     ) WITHOUT ROWID`)
     yield* sql.unsafe("CREATE UNIQUE INDEX events_key ON events (key) WHERE key IS NOT NULL")
-  })
+  }),
+  // The actor store mints no subjects, but it is the same store class as a thread, so its schema
+  // carries the same index beside the log it never populates.
+  "0002_actor_subjects": subjectIndexSchema
 })
 
 const createThreadIdentity = Effect.gen(function* () {
@@ -81,7 +103,8 @@ const threadMigrations = SqliteMigrator.fromRecord({
       PRIMARY KEY (seq)
     ) WITHOUT ROWID`)
     yield* sql.unsafe("CREATE UNIQUE INDEX events_key ON events (key) WHERE key IS NOT NULL")
-  })
+  }),
+  "0003_thread_subjects": subjectIndexSchema
 })
 
 const initializeDatabase = (loader: SqliteMigrator.Loader): Effect.Effect<void, never, SqlClient.SqlClient> =>
@@ -99,23 +122,67 @@ export class CloudflareEventStore implements ThreadEventStore {
   readonly keyOf: (event: Event) => string | undefined
   readonly codec: CloudflareEventCodec
   readonly indexKey: CloudflareEventKeyIndex
+  readonly subjectOf: (event: Event) => string | undefined
 
   constructor(
     sql: SqlClient.SqlClient,
     keyOf: (event: Event) => string | undefined,
     codec: CloudflareEventCodec = plaintextEventCodec,
-    indexKey: CloudflareEventKeyIndex = plaintextEventKeyIndex
+    indexKey: CloudflareEventKeyIndex = plaintextEventKeyIndex,
+    subjectOf: (event: Event) => string | undefined = messageSubjects.subjectOf
   ) {
     this.sql = sql
     this.keyOf = keyOf
     this.codec = codec
     this.indexKey = indexKey
+    this.subjectOf = subjectOf
   }
 
+  // initialize runs the schema and then brings the subject index up to the durable head, so an
+  // indexed read never runs against a store that skipped either step: a log that predates the
+  // subject table answers exactly like one created after it (storage.test.ts, "a pre-existing log answers indexed facts after upgrade").
   initialize(): Effect.Effect<void> {
     return initializeDatabase(threadMigrations).pipe(
-      Effect.provideService(SqlClient.SqlClient, this.sql)
+      Effect.provideService(SqlClient.SqlClient, this.sql),
+      Effect.flatMap(() => this.captureSubjects())
     )
+  }
+
+  // captureSubjects derives subjects for events the index does not hold yet: the capture row names
+  // the head through which every event is indexed, an append that extends an indexed head keeps it
+  // moving, and this pass closes whatever gap remains, latest occurrence winning per subject
+  // (storage.test.ts, "an appended fact is visible to the next lookup").
+  private captureSubjects(): Effect.Effect<void> {
+    const sql = this.sql
+    const subjectOf = this.subjectOf
+    const indexKey = this.indexKey
+    const decode = (batch: ReadonlyArray<Event>) => this.decode(batch)
+    return sql.withTransaction(Effect.gen(function* () {
+      const captured = yield* sql.unsafe<{ readonly head: number }>(
+        "SELECT head FROM event_subjects_capture WHERE singleton = 1"
+      )
+      const heads = yield* sql.unsafe<{ readonly head: number }>(
+        "SELECT COALESCE(MAX(seq), 0) AS head FROM events"
+      )
+      const from = Number(captured[0]?.head ?? 0)
+      const to = Number(heads[0]?.head ?? 0)
+      if (from >= to) return
+      const rows = yield* sql.unsafe<{ readonly seq: number; readonly event: string }>(
+        "SELECT seq, event FROM events WHERE seq > ? AND seq <= ? ORDER BY seq",
+        [from, to]
+      )
+      const events = yield* decode(rows.map((row) => JSON.parse(row.event) as Event))
+      for (let index = 0; index < rows.length; index++) {
+        const subject = subjectOf(events[index]!)
+        if (subject === undefined) continue
+        const sealed = yield* indexKey(subject)
+        yield* sql.unsafe(
+          "INSERT INTO event_subjects (subject, seq, event) VALUES (?, ?, ?) ON CONFLICT(subject) DO UPDATE SET seq = excluded.seq, event = excluded.event",
+          [sealed, Number(rows[index]!.seq), rows[index]!.event]
+        )
+      }
+      yield* sql.unsafe("UPDATE event_subjects_capture SET head = ? WHERE singleton = 1", [to])
+    })).pipe(Effect.orDie)
   }
 
   get read(): Effect.Effect<ReadonlyArray<Event>> {
@@ -166,6 +233,38 @@ export class CloudflareEventStore implements ThreadEventStore {
       )
   }
 
+  // readKey answers the one event a durable key names, through the same index transform the
+  // append that wrote it sealed with (storage.test.ts, "a sealed deployment answers indexed facts").
+  readKey(key: string): Effect.Effect<ThreadEventRow | undefined> {
+    return this.indexKey(key).pipe(
+      Effect.flatMap((sealed) => this.rowAt("SELECT seq, event FROM events WHERE key = ?", sealed)),
+      Effect.orDie
+    )
+  }
+
+  // readSubject answers the latest event a subject names: the index row written by the append
+  // that committed it, so the answer is the durable head and nothing ahead of it or behind it
+  // (storage.test.ts, "an appended fact is visible to the next lookup").
+  readSubject(subject: string): Effect.Effect<ThreadEventRow | undefined> {
+    return this.indexKey(subject).pipe(
+      Effect.flatMap((sealed) => this.rowAt("SELECT seq, event FROM event_subjects WHERE subject = ?", sealed)),
+      Effect.orDie
+    )
+  }
+
+  private rowAt(statement: string, sealed: string): Effect.Effect<ThreadEventRow | undefined> {
+    return this.sql.unsafe<{ readonly seq: number; readonly event: string }>(statement, [sealed]).pipe(
+      Effect.flatMap((rows) => {
+        const row = rows[0]
+        if (row === undefined) return Effect.succeed(undefined)
+        return this.decode([JSON.parse(row.event) as Event]).pipe(
+          Effect.map((events) => ({ seq: Number(row.seq), event: events[0]! }))
+        )
+      }),
+      Effect.orDie
+    )
+  }
+
   private decode(events: ReadonlyArray<Event>): Effect.Effect<ReadonlyArray<Event>> {
     return this.codec.decode(events).pipe(
       Effect.flatMap((decoded) => decoded.length === events.length
@@ -189,10 +288,15 @@ export class CloudflareEventStore implements ThreadEventStore {
     const keyOf = this.keyOf
     const codec = this.codec
     const indexKey = this.indexKey
+    const subjectOf = this.subjectOf
     return Effect.gen(function* () {
       const indexedKeys = yield* Effect.forEach(events, (event) => {
         const eventKey = keyOf(event)
         return eventKey === undefined ? Effect.void : indexKey(eventKey)
+      })
+      const indexedSubjects = yield* Effect.forEach(events, (event) => {
+        const subject = subjectOf(event)
+        return subject === undefined ? Effect.succeed(undefined) : indexKey(subject)
       })
       const encoded = yield* codec.encode(events)
       if (encoded.length !== events.length) {
@@ -220,8 +324,25 @@ export class CloudflareEventStore implements ThreadEventStore {
               "INSERT INTO events (seq, key, event) VALUES (?, ?, ?)",
               [seq, indexedKey ?? null, JSON.stringify(event)]
             )
+            // A subject row lands with the event it names, in the same transaction: an absorbed
+            // append writes no row, so the index never answers an event the log does not hold.
+            const indexedSubject = indexedSubjects[index]
+            if (indexedSubject !== undefined) {
+              yield* sql.unsafe(
+                "INSERT INTO event_subjects (subject, seq, event) VALUES (?, ?, ?) ON CONFLICT(subject) DO UPDATE SET seq = excluded.seq, event = excluded.event",
+                [indexedSubject, seq, JSON.stringify(event)]
+              )
+            }
             seq += 1
             appended += 1
+          }
+          // The capture row moves only when it already held the head this append extends; a log
+          // still waiting for its capture pass keeps its gap, and the pass closes it.
+          if (appended > 0) {
+            yield* sql.unsafe(
+              "UPDATE event_subjects_capture SET head = ? WHERE singleton = 1 AND head >= ?",
+              [seq - 1, currentHead]
+            )
           }
           return { appended, head: seq - 1 }
         })

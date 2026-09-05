@@ -7,6 +7,7 @@ import { SqlClient } from "effect/unstable/sql"
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-bun"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import { EventLog, eventLogFrom, type AppendResult, type ThreadEventRow, type ThreadEventStore } from "@clavia/tardigrade-core/log"
+import { messageSubjects } from "@clavia/tardigrade-core/communication/message"
 import { mappedDirectory } from "@clavia/tardigrade-core/communication/directory"
 import { Router, directoryRoute, sendThrough, type TransportRoute } from "@clavia/tardigrade-core/communication/router"
 import type { Transport } from "@clavia/tardigrade-core/communication/transport"
@@ -81,6 +82,9 @@ export type BunHostOptions<R> = {
   readonly alarm?: BunAlarmScheduler
   readonly pick?: (dirty: ReadonlySet<string>) => string
   readonly keyOf?: (event: Event) => string | undefined
+  // subjectOf extends the read-side subject derivation with the application's own fragments
+  // (composeSubjects), the read-index mirror of keyOf's composition.
+  readonly subjectOf?: (event: Event) => string | undefined
   readonly commitObserverFor?: (context: { readonly actorInstance: string; readonly thread: string }) => CommitObserver
 } & LayersFor<R>
 
@@ -202,6 +206,21 @@ const threadMigrations = SqliteMigrator.fromRecord({
       event TEXT NOT NULL
     ) WITHOUT ROWID`
     yield* sql`CREATE UNIQUE INDEX events_key ON events (key) WHERE key IS NOT NULL`
+  }),
+  // The read-side index beside the log: one row per subject holding the latest event that names
+  // it, and one capture row recording the log head the index holds.
+  "0003_thread_subjects": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE event_subjects (
+      subject TEXT PRIMARY KEY,
+      seq INTEGER NOT NULL,
+      event TEXT NOT NULL
+    ) WITHOUT ROWID`
+    yield* sql`CREATE TABLE event_subjects_capture (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      head INTEGER NOT NULL
+    )`
+    yield* sql`INSERT INTO event_subjects_capture (singleton, head) VALUES (1, 0)`
   })
 })
 
@@ -354,6 +373,8 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
   )
   const storeKeyOf = (event: Event): string | undefined =>
     methodIngressKeyOf(event) ?? threadKeys.keyOf(event) ?? options.keyOf?.(event)
+  const storeSubjectOf = (event: Event): string | undefined =>
+    messageSubjects.subjectOf(event) ?? options.subjectOf?.(event)
   const runtimes = new Map<string, Promise<BunThreadRuntime>>()
   const reconciliations = new Map<string, {
     readonly actor: Actor<R>
@@ -379,6 +400,26 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
     try {
       sql = await runtime.runPromise(SqlClient.SqlClient)
       await runtime.runPromise(initializeDatabase(threadMigrations))
+      // The subject index starts caught up to the durable head, so a database that predates the
+      // table answers indexed reads exactly like one created after it
+      // (host.test.ts, "a pre-existing thread answers indexed facts after upgrade").
+      await runtime.runPromise(sql.withTransaction(Effect.gen(function* () {
+        const captured = yield* sql<{ head: number }>`SELECT head FROM event_subjects_capture WHERE singleton = 1`
+        const heads = yield* sql<{ head: number }>`SELECT COALESCE(MAX(seq), 0) AS head FROM events`
+        const from = Number(captured[0]?.head ?? 0)
+        const to = Number(heads[0]?.head ?? 0)
+        if (from >= to) return
+        const rows = yield* sql<{ seq: number; event: string }>`
+          SELECT seq, event FROM events WHERE seq > ${from} AND seq <= ${to} ORDER BY seq
+        `
+        for (const row of rows) {
+          const subject = storeSubjectOf(JSON.parse(row.event) as Event)
+          if (subject === undefined) continue
+          yield* sql`INSERT INTO event_subjects (subject, seq, event) VALUES (${subject}, ${Number(row.seq)}, ${row.event})
+            ON CONFLICT(subject) DO UPDATE SET seq = excluded.seq, event = excluded.event`
+        }
+        yield* sql`UPDATE event_subjects_capture SET head = ${to} WHERE singleton = 1`
+      })).pipe(Effect.orDie))
       await runtime.runPromise(sql`
         INSERT OR IGNORE INTO thread_identity (singleton, actor, instance, thread)
         VALUES (1, ${actorName}, ${actorInstance}, ${thread})
@@ -411,6 +452,27 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
       Effect.map((rows) => rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(row.event) as Event }))),
       Effect.orDie
     )
+    // readKey answers the one event a durable key names, and readSubject the latest event a
+    // subject names, each from its index beside the log (host.test.ts, "a receipt's facts answer
+    // from the index, never a scan from zero").
+    const readKey: ThreadEventStore["readKey"] = (key) => sql<{ seq: number; event: string }>`
+      SELECT seq, event FROM events WHERE key = ${key}
+    `.pipe(
+      Effect.map((rows) => {
+        const row = rows[0]
+        return row === undefined ? undefined : { seq: Number(row.seq), event: JSON.parse(row.event) as Event }
+      }),
+      Effect.orDie
+    )
+    const readSubject: ThreadEventStore["readSubject"] = (subject) => sql<{ seq: number; event: string }>`
+      SELECT seq, event FROM event_subjects WHERE subject = ${subject}
+    `.pipe(
+      Effect.map((rows) => {
+        const row = rows[0]
+        return row === undefined ? undefined : { seq: Number(row.seq), event: JSON.parse(row.event) as Event }
+      }),
+      Effect.orDie
+    )
     const commits = await runtime.runPromise(PubSub.sliding<number>({ capacity: 1, replay: 1 }))
     const interruptions = effectInterruptionRegistry()
     const observer = options.commitObserverFor?.({ actorInstance, thread })
@@ -433,8 +495,20 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
             if (Number(present[0]?.n ?? 0) > 0) continue
           }
           yield* sql`INSERT INTO events (seq, key, event) VALUES (${seq}, ${key ?? null}, ${JSON.stringify(event)})`
+          // A subject row lands with the event it names, in the same transaction: an absorbed
+          // append writes no row, so the index never answers an event the log does not hold.
+          const subject = storeSubjectOf(event)
+          if (subject !== undefined) {
+            yield* sql`INSERT INTO event_subjects (subject, seq, event) VALUES (${subject}, ${seq}, ${JSON.stringify(event)})
+              ON CONFLICT(subject) DO UPDATE SET seq = excluded.seq, event = excluded.event`
+          }
           seq += 1
           appended += 1
+        }
+        // The capture row moves only when it already held the head this append extends; a log
+        // still waiting for its capture pass keeps its gap, and the pass closes it.
+        if (appended > 0) {
+          yield* sql`UPDATE event_subjects_capture SET head = ${seq - 1} WHERE singleton = 1 AND head >= ${currentHead}`
         }
         return { appended, head: seq - 1 }
       })).pipe(
@@ -449,7 +523,7 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
     }
     return {
       runtime,
-      store: { append, read, head, readFrom, readPage },
+      store: { append, read, head, readFrom, readPage, readKey, readSubject },
       commits,
       interruptions,
       ...(commitDispatcher === undefined ? {} : { commitDispatcher }),
