@@ -25,6 +25,7 @@ Base path `/v1`. Runtime routes address the actor mounted at the server origin. 
 | `GET /v1/threads/{id}/methods/{method}/calls/{call}` | Read a method call's derived state |
 | `POST /v1/threads/{id}/events` | Append an event, creating the thread if new |
 | `GET /v1/threads/{id}/events` | Read the log. `after`, `limit`, `types` |
+| `GET /v1/threads/{id}/fact` | Read one exact durable fact, the row a `key` names or the latest row a `subject` names. State exactly one of `key`, `subject` |
 | `GET /v1/threads/{id}/events/stream` | Follow the log. Server-sent events resume from `Last-Event-ID` |
 | `GET /v1/actors/{actor}/threads/{id}/inference/stream` | Follow transient model text produced after the connection opens |
 | `GET /v1/threads/{id}/projections/{projection}` | Read a projection the mounted actor declares |

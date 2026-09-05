@@ -6,9 +6,9 @@ An actor is a behavior definition. A thread is one durable run of that actor. Ev
 
 `ThreadEventStore` is the storage contract for one thread. Its operations do not accept a thread identifier because the store already has that identity. Host ingress, host reads, and reactors use the same store object, so append policy and read behavior cannot diverge between paths.
 
-An actor instance is a durable supervisor. Its event log records `ThreadRequested` and `ThreadCreated`, and its thread tree is a projection of those events. Event data remains in each thread's store.
+`readKey` answers the one event a durable key names, and `readSubject` the latest event a subject names. A key names one occurrence; a subject names one fact, and a later event under the same subject supersedes the earlier one. Each answer comes from an index beside the log, in time proportional to the answer, so a read that refreshes a receipt pays for its facts instead of the session. The subject index is a separate table: the key index is an append-time deduplication structure with at most one row per key, so it cannot hold a superseding occurrence, and the message events a receipt needs are deliberately unkeyed. A store initialized over a log that predates the table captures the missing subjects before its first indexed read, so an existing thread answers exactly like one created after the table.
 
-The parent thread records `ChildCreated` before sending the child's first delivery. The child records `ThreadCreated` as the first event in its own log. The parent record owns discovery and carries the requested placement. The child record confirms its identity, parent, depth, and placement after the host applies its default.
+An actor instance is a durable supervisor. Its event log records `ThreadRequested` and `ThreadCreated`, and its thread tree is a projection of those events. Event data remains in each thread's store.
 
 ## Durable Object layout
 
@@ -44,6 +44,6 @@ Root creation passes through the Actor DO once. For a child, the Thread DO first
   <img alt="A thread event passes through storeFor, is bound to its thread and event identity inside encrypted plaintext, stored as AES-GCM ciphertext, decrypted, and verified before use" src="../assets/encrypted-thread-store-light.svg">
 </picture>
 
-`hmacSha256EventKeyIndex` binds the HMAC input to the thread and returns a versioned hexadecimal index. The application supplies HMAC key material separate from its AES-GCM key. This prevents the SQLite index from exposing sensitive grant tokens, call IDs, and other event key identifiers.
+`hmacSha256EventKeyIndex` binds the HMAC input to the thread and returns a versioned hexadecimal index. The application supplies HMAC key material separate from its AES-GCM key. This prevents the SQLite index from exposing sensitive grant tokens, call IDs, and other event key identifiers. The subject index passes its coordinates through the same `indexKey` transform, so a sealed deployment answers exact-fact reads by sealing the query the same way while the table holds no readable coordinates.
 
 workerd does not support importing an HKDF key through `SubtleCrypto`, so the application must provision raw keys or use an external key service. workerd also ignores AES-GCM `additionalData`. The binding therefore lives inside the encrypted plaintext and is checked after decryption. A random 96-bit initialization vector is generated for every encrypted event.
