@@ -48,6 +48,74 @@ const methodState = async (thread: string, call: string): Promise<unknown> => {
   return undefined
 }
 
+// Both deadline properties drive one hold actor: a cancellable method whose invocation completes or
+// cancels on record, so the atomic and stale-snapshot tests share its fixture.
+interface HoldState {
+  readonly requests: ReadonlySet<string>
+  readonly completed: ReadonlySet<string>
+  readonly cancelled: ReadonlySet<string>
+}
+const initialHoldState = (): HoldState => ({ requests: new Set(), completed: new Set(), cancelled: new Set() })
+const stepHoldState = (hold: HoldState, event: Event): HoldState => {
+  const id = String((event as { readonly id?: unknown }).id ?? "")
+  if (event.type === "HoldRequested" && !hold.requests.has(id)) {
+    return { ...hold, requests: new Set(hold.requests).add(id) }
+  }
+  if (event.type === "HoldCompleted" && !hold.completed.has(id)) {
+    return { ...hold, completed: new Set(hold.completed).add(id) }
+  }
+  if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
+    return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
+  }
+  return hold
+}
+const hold = actorMethod({
+  input: Schema.Struct({ text: Schema.String }),
+  output: Schema.String,
+  event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
+  projection: {
+    initial: initialHoldState,
+    step: stepHoldState,
+    output: (hold: HoldState) => ({
+      currentEpoch: () => 0,
+      invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
+        : hold.cancelled.has(invocation.id)
+          ? { status: "cancelled" as const, cause: "deadline" as const }
+          : hold.completed.has(invocation.id)
+            ? { status: "completed" as const, output: "done" }
+            : { status: "pending" as const }
+    })
+  },
+  cancellation: {
+    event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
+  }
+})
+const holdComponent = component<HoldState, undefined>({
+  name: "hold",
+  keys: {
+    prefixes: ["hold-request:", "hold-complete:", "hold-cancel:"],
+    keyOf: (event) => {
+      if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
+      if (event.type === "HoldCompleted") return `hold-complete:${String((event as { readonly id?: unknown }).id)}`
+      if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
+      return undefined
+    }
+  },
+  initial: initialHoldState,
+  step: stepHoldState,
+  output: () => ({ view: undefined, transitions: [] })
+})
+const holdDeadlineActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
+const deadlineThreadHost = (state: DurableObjectState, thread: string) =>
+  createCloudflareThreadHost({
+    storage: state.storage,
+    actorName: "echo",
+    actorInstance: "main",
+    thread,
+    actor: holdDeadlineActor,
+    keyOf: holdDeadlineActor.keyOf
+  })
+
 beforeAll(async () => {
   const db = (env as Env).CATALOG_DB
   const statements = (env as Env & { readonly CATALOG_MIGRATION: string }).CATALOG_MIGRATION
@@ -280,63 +348,7 @@ describe("cloudflare actor", () => {
 
   test("an alarm commits its deadline cancellation atomically", async () => {
     const result = await runInDurableObject(threadStub("deadline-atomicity"), async (_instance, state) => {
-      interface HoldState {
-        readonly requests: ReadonlySet<string>
-        readonly cancelled: ReadonlySet<string>
-      }
-      const initialHoldState = (): HoldState => ({ requests: new Set(), cancelled: new Set() })
-      const stepHoldState = (hold: HoldState, event: Event): HoldState => {
-        const id = String((event as { readonly id?: unknown }).id ?? "")
-        if (event.type === "HoldRequested" && !hold.requests.has(id)) {
-          return { ...hold, requests: new Set(hold.requests).add(id) }
-        }
-        if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
-          return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
-        }
-        return hold
-      }
-      const hold = actorMethod({
-        input: Schema.Struct({ text: Schema.String }),
-        output: Schema.String,
-        event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
-        projection: {
-          initial: initialHoldState,
-          step: stepHoldState,
-          output: (hold: HoldState) => ({
-            currentEpoch: () => 0,
-            invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
-              : hold.cancelled.has(invocation.id)
-                ? { status: "cancelled" as const, cause: "deadline" as const }
-                : { status: "pending" as const }
-          })
-        },
-        cancellation: {
-          event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
-        }
-      })
-      const holdComponent = component<HoldState, undefined>({
-        name: "hold",
-        keys: {
-          prefixes: ["hold-request:", "hold-cancel:"],
-          keyOf: (event) => {
-            if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
-            if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
-            return undefined
-          }
-        },
-        initial: initialHoldState,
-        step: stepHoldState,
-        output: () => ({ view: undefined, transitions: [] })
-      })
-      const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
-      const host = await createCloudflareThreadHost({
-        storage: state.storage,
-        actorName: "echo",
-        actorInstance: "main",
-        thread: "ag.deadline-atomicity",
-        actor: holdActor,
-        keyOf: holdActor.keyOf
-      })
+      const host = await deadlineThreadHost(state, "ag.deadline-atomicity")
       const deadlineAt = Date.now() - 1
       await host.commitRoot({
         type: "HoldRequested",
@@ -391,70 +403,7 @@ describe("cloudflare actor", () => {
 
   test("a stale deadline cancellation leaves a settled invocation unchanged", async () => {
     const result = await runInDurableObject(threadStub("stale-deadline-cancellation"), async (_instance, state) => {
-      interface HoldState {
-        readonly requests: ReadonlySet<string>
-        readonly completed: ReadonlySet<string>
-        readonly cancelled: ReadonlySet<string>
-      }
-      const initialHoldState = (): HoldState => ({ requests: new Set(), completed: new Set(), cancelled: new Set() })
-      const stepHoldState = (hold: HoldState, event: Event): HoldState => {
-        const id = String((event as { readonly id?: unknown }).id ?? "")
-        if (event.type === "HoldRequested" && !hold.requests.has(id)) {
-          return { ...hold, requests: new Set(hold.requests).add(id) }
-        }
-        if (event.type === "HoldCompleted" && !hold.completed.has(id)) {
-          return { ...hold, completed: new Set(hold.completed).add(id) }
-        }
-        if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
-          return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
-        }
-        return hold
-      }
-      const hold = actorMethod({
-        input: Schema.Struct({ text: Schema.String }),
-        output: Schema.String,
-        event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
-        projection: {
-          initial: initialHoldState,
-          step: stepHoldState,
-          output: (hold: HoldState) => ({
-            currentEpoch: () => 0,
-            invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
-              : hold.cancelled.has(invocation.id)
-                ? { status: "cancelled" as const, cause: "deadline" as const }
-                : hold.completed.has(invocation.id)
-                  ? { status: "completed" as const, output: "done" }
-                  : { status: "pending" as const }
-          })
-        },
-        cancellation: {
-          event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
-        }
-      })
-      const holdComponent = component<HoldState, undefined>({
-        name: "hold",
-        keys: {
-          prefixes: ["hold-request:", "hold-complete:", "hold-cancel:"],
-          keyOf: (event) => {
-            if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
-            if (event.type === "HoldCompleted") return `hold-complete:${String((event as { readonly id?: unknown }).id)}`
-            if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
-            return undefined
-          }
-        },
-        initial: initialHoldState,
-        step: stepHoldState,
-        output: () => ({ view: undefined, transitions: [] })
-      })
-      const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
-      const host = await createCloudflareThreadHost({
-        storage: state.storage,
-        actorName: "echo",
-        actorInstance: "main",
-        thread: "ag.stale-deadline-cancellation",
-        actor: holdActor,
-        keyOf: holdActor.keyOf
-      })
+      const host = await deadlineThreadHost(state, "ag.stale-deadline-cancellation")
       const invocation = { method: "hold", id: "hold-1", epoch: 0 }
       const deadlineAt = Date.now() - 1
       await host.commitRoot({
