@@ -113,12 +113,12 @@ describe("agentsPackage", () => {
     expect(appended).toContainEqual(expect.objectContaining({
       type: "InvocationLinked",
       parent: { method: "message", id: "m1", epoch: 2 },
-      child: expect.objectContaining({ invocation: { method: "message", id: "child-1", epoch: 0 } }),
+      child: expect.objectContaining({ invocation: { method: "message", id: await expectedThread("m1", "child-1"), epoch: 0 } }),
       target: `mem:main:${await expectedThread("m1", "child-1")}`
     }))
     expect(sent[0]?.call).toMatchObject({
       parent: { method: "message", id: "m1", epoch: 2 },
-      invocation: { method: "message", id: "child-1", epoch: 0 }
+      invocation: { method: "message", id: await expectedThread("m1", "child-1"), epoch: 0 }
     })
   })
 
@@ -127,7 +127,7 @@ describe("agentsPackage", () => {
     expect(system).not.toContain("agents.continue")
     expect(system).toContain("agents.providers({cursor?: string, search?: string, limit?: number})")
     expect(system).toContain("agents.models({cursor?: string, search?: string, limit?: number, provider?: string, sort?: \"promptUsdPerToken\" | \"completionUsdPerToken\" | \"cachedPromptUsdPerToken\" | \"cacheWritePromptUsdPerToken\", order?: \"asc\" | \"desc\", unpriced?: \"first\" | \"last\"})")
-    expect(system).toContain("agents.run({text: string, background?: boolean, output?: unknown, model?: {provider: string, model_id: string}, budget?: number, placement?: \"colocated\" | \"independent\", escalatable?: boolean}) -> {output?: unknown, error?: string, dispatched?: boolean, callId?: string}")
+    expect(system).toContain("agents.run({text: string, background?: boolean, output?: unknown, model?: {provider: string, model_id: string}, budget?: number, placement?: \"colocated\" | \"independent\", escalatable?: boolean}) -> {output?: unknown, error?: string, dispatched?: boolean, callId?: string, handle?: string}")
   })
 
   test("catalog searches return the host API pages", async () => {
@@ -244,9 +244,9 @@ describe("agentsPackage", () => {
         Effect.provide(env("mem:main:ag.root", sent, { "ag.root": [turn("m1"), called("c3", "m1")] }))
       )
     )
-    expect(answer).toEqual({ dispatched: true, callId: "c3" })
+    expect(answer).toEqual({ dispatched: true, callId: "c3", handle: await expectedThread("m1", "c3") })
     const brief = sent[0]!.event as { id?: unknown }
-    expect(brief.id).toBe("c3")
+    expect(brief.id).toBe(await expectedThread("m1", "c3"))
     expect(sent[0]!.link).toEqual({
       source: { actor: "mem", instance: "main", thread: "ag.root" },
       target: { actor: "mem", instance: "main", thread: await expectedThread("m1", "c3") }
@@ -341,7 +341,7 @@ describe("agentsPackage", () => {
     const sent: Array<Sent> = []
     const pkg = agentsPackage()
     const threads = {
-      "ag.root": [turn("m1"), called("c4", "m1"), response("c4", "completed", "4")]
+      "ag.root": [turn("m1"), called("c4", "m1"), response(await expectedThread("m1", "c4"), "completed", "4")]
     } as Readonly<Record<string, ReadonlyArray<Event>>>
     const answer = await Effect.runPromise(
       pkg.methods.run!({ text: "sum 2+2" }, { callId: "c4" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threads)))
@@ -364,7 +364,7 @@ describe("agentsPackage", () => {
       )
     )
     expect(parked).toBeInstanceOf(Park)
-    expect((parked as Park).awaiting).toBe(replyId("c5"))
+    expect((parked as Park).awaiting).toBe(replyId(await expectedThread("m1", "c5")))
     expect(formatThreadAddress(sent[0]!.link.target as ThreadAddress)).toBe(`mem:main:${await expectedThread("m1", "c5")}`)
   })
 
@@ -375,7 +375,7 @@ describe("agentsPackage", () => {
       "ag.root": [
         turn("m1"),
         called("c7", "m1"),
-        response("c7", "cancelled", "deadline reached", { cause: "deadline", deadlineAt: 9 })
+        response(await expectedThread("m1", "c7"), "cancelled", "deadline reached", { cause: "deadline", deadlineAt: 9 })
       ]
     } as Readonly<Record<string, ReadonlyArray<Event>>>
     const answer = await Effect.runPromise(
@@ -392,7 +392,7 @@ describe("agentsPackage", () => {
       "ag.root": [response("c8", "cancelled", "")]
     } as Readonly<Record<string, ReadonlyArray<Event>>>
     const answer = await Effect.runPromise(
-      pkg.methods.result!({ id: "c8" }, { callId: "r8" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threads)))
+      pkg.methods.result!({ handle: "c8" }, { callId: "r8" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threads)))
     )
     expect(answer).toEqual({ error: "cancelled" })
     expect(sent.length).toBe(0)
@@ -407,7 +407,7 @@ describe("agentsPackage", () => {
       ]
     } as Readonly<Record<string, ReadonlyArray<Event>>>
     const answer = await Effect.runPromise(
-      pkg.methods.result!({ id: "c6" }, { callId: "c7" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threads)))
+      pkg.methods.result!({ handle: "c6" }, { callId: "c7" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threads)))
     )
     expect(answer).toEqual({ error: "nope" })
   })
@@ -571,7 +571,9 @@ describe("a child is named by its parent address, run, and call", () => {
     expect(sent).toHaveLength(0)
   })
 
-  test("a background child inherits the owning turn deadline without a parent link", async () => {
+  test("a background child inherits the owner deadline and stays linked for cancellation", async () => {
+    // Background changes response waiting, never ownership: the child carries no response parent,
+    // but the owner link keeps explicit and deadline cancellation reaching it.
     const events: Event[] = [
       threadCreated(parseThreadAddress("mem:main:ag.root"), undefined, 0),
       turnWithDeadline("m1", 86_400_002),
@@ -580,10 +582,40 @@ describe("a child is named by its parent address, run, and call", () => {
     const sent: Array<Sent> = []
     await Effect.runPromise(background("scout", "bg-1").pipe(Effect.provide(liveEnv(events, sent))))
     expect(sent[0]?.call).toEqual({
-      invocation: { method: "message", id: "bg-1", epoch: 0 },
+      invocation: { method: "message", id: await expectedThread("m1", "bg-1"), epoch: 0 },
       deadlineAt: 86_400_002
     })
-    expect(events.some((event) => event.type === "InvocationLinked")).toBe(false)
+    expect(events.filter((event) => event.type === "InvocationLinked")).toMatchObject([
+      {
+        parent: { method: "message", id: "m1", epoch: 0 },
+        child: { invocation: { method: "message", id: await expectedThread("m1", "bg-1"), epoch: 0 } },
+        target: `mem:main:${await expectedThread("m1", "bg-1")}`
+      }
+    ])
+  })
+
+  test("a parent's structured input rides the brief to the child", async () => {
+    const events: Event[] = [
+      threadCreated(parseThreadAddress("mem:main:ag.root"), undefined, 0),
+      { type: "MessageReceived", id: "m1", text: "delegate", input: { kind: "scout" }, at: 1 } as Event,
+      called("in-1", "m1")
+    ]
+    const sent: Array<Sent> = []
+    await Effect.runPromise(background("scout", "in-1").pipe(Effect.provide(liveEnv(events, sent))))
+    expect(sent[0]?.event).toMatchObject({ input: { kind: "scout" } })
+  })
+
+  test("a bare id is not a handle: result answers an error, never another turn's spawn", async () => {
+    const events: Event[] = [
+      threadCreated(parseThreadAddress("mem:main:ag.root"), undefined, 0),
+      turn("m1"),
+      called("h-1", "m1"),
+      response(await expectedThread("m1", "h-1"), "completed", "done")
+    ]
+    const answer = await Effect.runPromise(
+      agentsPackage().methods.result!({ id: "h-1" }, { callId: "r-1" }).pipe(Effect.provide(liveEnv(events, [])))
+    )
+    expect(answer).toEqual({ error: "agents.result needs { handle } from a background run" })
   })
 
   test("a run with no parent turn dies rather than naming a child", async () => {
@@ -693,7 +725,7 @@ describe("a run stays bound to the schema it was started under", () => {
     const sent: Array<Sent> = []
     const pkg = agentsPackage({ outputs })
     return Effect.runPromise(
-      pkg.methods.result!({ id: "b1" }, { callId: "later" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threadsFor)))
+      pkg.methods.result!({ handle: "b1" }, { callId: "later" }).pipe(Effect.provide(env("mem:main:ag.root", sent, threadsFor)))
     )
   }
 

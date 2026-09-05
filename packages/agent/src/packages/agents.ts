@@ -24,6 +24,7 @@ import {
   childThreadId,
   threadCreatedOf,
   type ThreadCreated,
+  type ThreadId,
   type ThreadLineage
 } from "@clavia/tardigrade-core/thread"
 import {
@@ -226,6 +227,20 @@ const catalogQueryOf = (args: unknown): AgentCatalogQuery => {
   }
 }
 
+// childInvocationId derives the durable identity of one child method invocation from the same
+// parent address and (turn, call) child key as its thread, so a spawn's brief, response
+// boundary, and result handle all name the exact turn that fired it (agents.test.ts, "a bare
+// id is not a handle: result answers an error, never another turn's spawn").
+export const childInvocationId = (coordinates: {
+  readonly parent: ThreadAddress
+  readonly turn: string
+  readonly call: string
+}): Promise<ThreadId> =>
+  childThreadId({
+    parent: coordinates.parent,
+    child: childKeyOf(JSON.stringify([coordinates.turn, coordinates.call]))
+  })
+
 // sibling derives a child address within the parent's actor instance (agents.test.ts, "the default address is the host's own sibling").
 const sibling = async (parentRunId: string, callId: string, self: ThreadAddress): Promise<ThreadAddress> =>
   threadAddressOf(self.actor, self.instance, await childThreadId({
@@ -323,7 +338,7 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
   const declared_ = Object.keys(outputs)
   return definePackage({
     name: "agents",
-    description: "Search known providers and available models, and run ad-hoc agents. providers() lists provider configuration requirements and availability. models() lists models from available providers with metadata and pricing; use provider to limit the search and sort to order a pricing field. run({text}) starts a fresh agent with the brief and waits for its terminal answer; add background: true for a long job, and result({id}) awaits the reply later. An escalatable child negotiates budget with its parent's requestBudget method while run remains pending.",
+    description: "Search known providers and available models, and run ad-hoc agents. providers() lists provider configuration requirements and availability. models() lists models from available providers with metadata and pricing; use provider to limit the search and sort to order a pricing field. run({text}) starts a fresh agent with the brief and waits for its terminal answer; add background: true for a long job, and result({handle}) awaits the reply later. An escalatable child negotiates budget with its parent's requestBudget method while run remains pending.",
     annotations: {
       providers: { readOnlyHint: true, openWorldHint: false },
       models: { readOnlyHint: true, openWorldHint: false },
@@ -355,12 +370,12 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
         output: modelPageSchema
       },
       run: {
-        description: `Brief a fresh agent. \`output\` makes the result structured and parsed: the name of a declared contract${declared_.length === 0 ? " (this host declares none)" : ` (${declared_.join(", ")})`}, or a JSON schema of your own. \`model\` selects one configured provider and model for this child. \`budget\` caps the agent's tool calls: at the cap it answers with its best result, so a research agent can not run forever. \`background: true\` returns { callId } at once; result({id: callId}) awaits the reply later. \`escalatable: true\` lets the child call its parent's requestBudget method at the cap while this run remains pending for one terminal answer.`,
+        description: `Brief a fresh agent. \`output\` makes the result structured and parsed: the name of a declared contract${declared_.length === 0 ? " (this host declares none)" : ` (${declared_.join(", ")})`}, or a JSON schema of your own. \`model\` selects one configured provider and model for this child. \`budget\` caps the agent's tool calls: at the cap it answers with its best result, so a research agent can not run forever. \`background: true\` returns { callId, handle }; retain the opaque handle and pass it unchanged to result({handle}).`,
         input: {
           type: "object",
           properties: {
             text: { type: "string", description: "the brief" },
-            background: { type: "boolean", description: "true: return { callId } at once, the reply arrives later via result()" },
+            background: { type: "boolean", description: "true: return { callId, handle } at once; pass handle unchanged to result()" },
             output: { description: "a declared contract's name, or a JSON schema for a structured answer" },
             model: {
               type: "object",
@@ -383,16 +398,17 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
           properties: {
             ...foregroundBoundarySchema.properties,
             dispatched: { type: "boolean" },
-            callId: { type: "string" }
+            callId: { type: "string" },
+            handle: { type: "string" }
           }
         }
       },
       result: {
-        description: "Await a run fired with `background: true`. Answers its terminal once the reply lands; parks the execution until then. An answer comes back parsed when the child accepted a contract with that call.",
+        description: "Await the exact run represented by the opaque handle returned from a background run.",
         input: {
           type: "object",
-          properties: { id: { type: "string", description: "the callId a background run answered" } },
-          required: ["id"]
+          properties: { handle: { type: "string", description: "opaque handle returned by a background run" } },
+          required: ["handle"]
         },
         output: {
           type: "object",
@@ -458,6 +474,9 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
           if (parentRun === undefined) {
             return yield* Effect.die(new Error(`agents.run ${ctx.callId} has no parent turn`))
           }
+          const invocationId = yield* Effect.promise(() =>
+            childInvocationId({ parent: source, turn: parentRun.turn, call: ctx.callId })
+          )
           const child = yield* Effect.promise(() =>
             childClaimOf(a?.placement, events, created, parentRun.turn, ctx.callId, source)
           )
@@ -491,9 +510,14 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
           const actor = actorNameOf()
           const shadow = shadowOf()
           const world = worldOf()
-          // owner supplies the deadline for both dispatch modes (agents.test.ts, "a background child inherits the owning turn deadline without a parent link").
+          // A background child has no response parent, but stays linked to the owning
+          // invocation so explicit and deadline cancellation cascade through the whole family
+          // (agents.test.ts, "a background child inherits the owner deadline and stays linked for cancellation").
           const owner = { method: "message", id: parentRun.turn, epoch: parentRun.epoch }
-          const parent = a?.background === true ? undefined : owner
+          const responseParent = a?.background === true ? undefined : owner
+          const spawningMessage = events.find(
+            (event) => event.type === "MessageReceived" && event.id === parentRun.turn
+          )
           const parentDeadline = events.find((event) => {
             const context = (event as { readonly call?: unknown }).call as Partial<ActorInvocationContext> | undefined
             return context?.invocation !== undefined &&
@@ -502,14 +526,14 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
               context.invocation.epoch === owner.epoch
           }) as ({ readonly call?: ActorInvocationContext } & Event) | undefined
           const childContext: ActorInvocationContext = {
-            invocation: { method: "message", id: ctx.callId, epoch: 0 },
-            ...(parent === undefined ? {} : { parent }),
+            invocation: { method: "message", id: invocationId, epoch: 0 },
+            ...(responseParent === undefined ? {} : { parent: responseParent }),
             ...(parentDeadline?.call?.deadlineAt === undefined ? {} : { deadlineAt: parentDeadline.call.deadlineAt })
           }
           const dispatch = (at: number) => Effect.gen(function* () {
-            const linked = parent === undefined
-              ? []
-              : [invocationLinked({ parent, child: childContext, target: formatThreadAddress(target), lineage, at })]
+            const linked = [
+              invocationLinked({ parent: owner, child: childContext, target: formatThreadAddress(target), lineage, at })
+            ]
             if (recordedChild === undefined || linked.length > 0) {
               yield* log.append([
                 ...(recordedChild === undefined ? [childCreated(ctx.callId, target, lineage, at, parentRun.turn)] : []),
@@ -518,8 +542,9 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
             }
             yield* router.send(methodEnvelopeOf(linkOf(source, target), childContext, {
               type: "MessageReceived",
-              id: ctx.callId,
+              id: invocationId,
               text,
+              input: spawningMessage?.input,
               ...(outputDeclaration === undefined ? {} : { output: outputDeclaration }),
               ...(selectedModel === undefined ? {} : { model: selectedModel }),
               models,
@@ -535,24 +560,28 @@ export const agentsPackage = (options: SpawnOptions = {}): Package<Router | Self
           if (a?.background === true) {
             const at = yield* Clock.currentTimeMillis
             yield* dispatch(at)
-            return { dispatched: true, callId: ctx.callId }
+            return { dispatched: true, callId: ctx.callId, handle: invocationId }
           }
-          const already = yield* awaitedBoundary(ctx.callId)
+          // Foreground runs park on their terminal response. A replay reads that response
+          // before redelivering the same brief.
+          const already = yield* awaitedBoundary(invocationId)
           if (already !== undefined) return shape(answerOf(already), ctx.callId, output)
           const at = yield* Clock.currentTimeMillis
           yield* dispatch(at)
-          return yield* new Park({ callId: ctx.callId, awaiting: boundaryId(ctx.callId, 0) })
+          return yield* new Park({ callId: ctx.callId, awaiting: boundaryId(invocationId, 0) })
         }),
-      // result validates a background response against its recorded output contract (agents.test.ts, "a later call cannot invent a contract the run never declared").
+      // result awaits a background run by its turn-scoped spawn identity and validates the
+      // response against its recorded output contract (agents.test.ts, "a later call cannot
+      // invent a contract the run never declared").
       result: (args, ctx) =>
         Effect.gen(function* () {
-          const a = args as { id?: unknown } | undefined
-          const id = String(a?.id ?? "")
-          if (id === "") return { error: "agents.result needs { id }" }
-          const reply = yield* awaitedBoundary(id)
+          const a = args as { handle?: unknown } | undefined
+          const handle = String(a?.handle ?? "")
+          if (handle === "") return { error: "agents.result needs { handle } from a background run" }
+          const reply = yield* awaitedBoundary(handle)
           if (reply?.contractError !== undefined) return { error: reply.contractError }
-          if (reply !== undefined) return shape(answerOf(reply), id, reply.contract)
-          return yield* new Park({ callId: ctx.callId, awaiting: boundaryId(id, 0) })
+          if (reply !== undefined) return shape(answerOf(reply), handle, reply.contract)
+          return yield* new Park({ callId: ctx.callId, awaiting: boundaryId(handle, 0) })
         })
     }
   })
@@ -625,7 +654,7 @@ const contractOf = (
     : { contract: built.contract }
 }
 
-// awaitedBoundaryOf reads a round-zero child response and its recorded output contract (agents.test.ts).
+// awaitedBoundaryOf projects one child response from the caller's private log. A cancelled response remains structured and settles the wait (agents.test.ts, "a cancelled reply settles the run as a failed answer", "a cancelled reply with no reason settles as a bare cancelled error"). A delivered method response is a ResponseReceived carrying the round-zero boundary id (response.test.ts, "returns a terminal through the accepted call link").
 const awaitedBoundaryOf = (events: ReadonlyArray<Event>, turn: string): SpawnBoundary | undefined => {
   const response = events.find(
     (event) => event.type === "ResponseReceived" && event.id === boundaryId(turn, 0)

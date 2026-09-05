@@ -9,7 +9,7 @@ import { threadAddressOf, type ThreadAddress } from "@clavia/tardigrade-core/com
 import type { RoutedEnvelope } from "@clavia/tardigrade-core/communication/envelope"
 import { threadCreated, threadCreatedOf, threadKeys, type ChildCreated } from "@clavia/tardigrade-core/thread"
 import { createHost } from "@clavia/tardigrade-host/host"
-import { agentsPackage } from "./agents"
+import { agentsPackage, childInvocationId } from "./agents"
 
 interface CallPlan {
   readonly callId: string
@@ -45,13 +45,20 @@ const childProtocol = async (calls: ReadonlyArray<CallPlan>): Promise<void> => {
       at: 2
     }))
   ]
+  // The brief names the child method invocation, not the bare package call id, so every action
+  // below keys by the spawn's durable identity.
+  const invocations = new Map<string, string>()
+  for (const plan of calls) {
+    invocations.set(plan.callId, await childInvocationId({ parent, turn: "turn-1", call: plan.callId }))
+  }
+  const invocation = (callId: string): string => invocations.get(callId)!
   const actions: Array<{ readonly kind: "append" | "send"; readonly callId: string; readonly target?: ThreadAddress }> = []
-  const remaining = new Map(calls.map((plan) => [plan.callId, plan.failures]))
-  const plansByCall = new Map(calls.map((plan) => [plan.callId, plan]))
+  const remaining = new Map(calls.map((plan) => [invocation(plan.callId), plan.failures]))
+  const plansByCall = new Map(calls.map((plan) => [invocation(plan.callId), plan]))
   const append = (events: ReadonlyArray<Event>): Effect.Effect<void> => Effect.sync(() => {
     for (const event of events) {
       if (event.type === "ChildCreated") {
-        const callId = String(event.callId)
+        const callId = invocation(String(event.callId))
         const left = remaining.get(callId) ?? 0
         if (left > 0 && plansByCall.get(callId)?.failurePoint === "record") {
           remaining.set(callId, left - 1)
@@ -62,7 +69,7 @@ const childProtocol = async (calls: ReadonlyArray<CallPlan>): Promise<void> => {
       if (key !== undefined && parentLog.some((candidate) => threadKeys.keyOf(candidate) === key)) continue
       parentLog.push(event)
       if (event.type === "ChildCreated") {
-        actions.push({ kind: "append", callId: String((event as { readonly callId?: unknown }).callId) })
+        actions.push({ kind: "append", callId: invocation(String((event as { readonly callId?: unknown }).callId)) })
       }
     }
   })
@@ -97,7 +104,9 @@ const childProtocol = async (calls: ReadonlyArray<CallPlan>): Promise<void> => {
         ).pipe(Effect.provide(environment), Effect.exit)
       )
       expect(result._tag).toBe(attempt < plan.failures ? "Failure" : "Success")
-      if (result._tag === "Success") expect(result.value).toEqual({ dispatched: true, callId: plan.callId })
+      if (result._tag === "Success") {
+        expect(result.value).toEqual({ dispatched: true, callId: plan.callId, handle: invocation(plan.callId) })
+      }
     }
   }
 
@@ -107,7 +116,7 @@ const childProtocol = async (calls: ReadonlyArray<CallPlan>): Promise<void> => {
 
   for (const plan of calls) {
     const record = records.find((candidate) => candidate.callId === plan.callId)!
-    const callActions = actions.filter((action) => action.callId === plan.callId)
+    const callActions = actions.filter((action) => action.callId === invocation(plan.callId))
     expect(callActions[0]?.kind).toBe("append")
     expect(callActions.filter((action) => action.kind === "append")).toHaveLength(1)
     expect(callActions.filter((action) => action.kind === "send")).toHaveLength(
@@ -176,15 +185,16 @@ describe("child creation protocol", () => {
               { type: "MessageReceived", id: currentTurn, text: "delegate", at: 1 },
               { type: "PackageCalled", callId, name: "agents.run", turn: currentTurn, at: 2 }
             )
+            const expected = await childInvocationId({ parent, turn: currentTurn, call: callId })
             const invoke = () => Effect.runPromise(run({ text: "child", background: true }, { callId })
               .pipe(Effect.provide(environment)))
-            expect(await invoke()).toEqual({ dispatched: true, callId })
+            expect(await invoke()).toEqual({ dispatched: true, callId, handle: expected })
             const first = target!
             expect(first.thread).toMatch(/^[0-9a-f]{64}$/)
             expect(first.thread).not.toBe(parent.thread)
             expect(targets.has(first.thread)).toBe(false)
             targets.add(first.thread)
-            expect(await invoke()).toEqual({ dispatched: true, callId })
+            expect(await invoke()).toEqual({ dispatched: true, callId, handle: expected })
             expect(target).toEqual(first)
             const records = events.filter((event) => event.type === "ChildCreated" && event.turn === currentTurn)
             expect(records).toHaveLength(1)
