@@ -106,6 +106,58 @@ const options = (path: string): BunHostOptions<never> => ({
   keyOf
 })
 
+// Both bun deadline properties drive one hold actor: a cancellable method whose invocation cancels
+// on record, so the atomic and alarm-only-repair tests share its fixture.
+interface HoldState {
+  readonly requests: ReadonlySet<string>
+  readonly cancelled: ReadonlySet<string>
+}
+const initialHoldState = (): HoldState => ({ requests: new Set(), cancelled: new Set() })
+const stepHoldState = (hold: HoldState, event: Event): HoldState => {
+  const id = String((event as { readonly id?: unknown }).id ?? "")
+  if (event.type === "HoldRequested" && !hold.requests.has(id)) {
+    return { ...hold, requests: new Set(hold.requests).add(id) }
+  }
+  if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
+    return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
+  }
+  return hold
+}
+const hold = actorMethod({
+  input: Schema.Struct({ text: Schema.String }),
+  output: Schema.String,
+  event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
+  projection: {
+    initial: initialHoldState,
+    step: stepHoldState,
+    output: (hold: HoldState) => ({
+      currentEpoch: () => 0,
+      invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
+        : hold.cancelled.has(invocation.id)
+          ? { status: "cancelled" as const, cause: "deadline" as const }
+          : { status: "pending" as const }
+    })
+  },
+  cancellation: {
+    event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
+  }
+})
+const holdComponent = component<HoldState, undefined>({
+  name: "hold",
+  keys: {
+    prefixes: ["hold-request:", "hold-cancel:"],
+    keyOf: (event) => {
+      if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
+      if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
+      return undefined
+    }
+  },
+  initial: initialHoldState,
+  step: stepHoldState,
+  output: () => ({ view: undefined, transitions: [] })
+})
+const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
+
 describe("the bun host", () => {
   test("root creation awaits the configured reservation and reuses it on later messages", async () => {
     const requests: string[] = []
@@ -458,55 +510,6 @@ describe("the bun host", () => {
 
   test("an alarm commits its deadline cancellation atomically", async () => {
     const path = freshPath()
-    interface HoldState {
-      readonly requests: ReadonlySet<string>
-      readonly cancelled: ReadonlySet<string>
-    }
-    const initialHoldState = (): HoldState => ({ requests: new Set(), cancelled: new Set() })
-    const stepHoldState = (hold: HoldState, event: Event): HoldState => {
-      const id = String((event as { readonly id?: unknown }).id ?? "")
-      if (event.type === "HoldRequested" && !hold.requests.has(id)) {
-        return { ...hold, requests: new Set(hold.requests).add(id) }
-      }
-      if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
-        return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
-      }
-      return hold
-    }
-    const hold = actorMethod({
-      input: Schema.Struct({ text: Schema.String }),
-      output: Schema.String,
-      event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
-      projection: {
-        initial: initialHoldState,
-        step: stepHoldState,
-        output: (hold: HoldState) => ({
-          currentEpoch: () => 0,
-          invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
-            : hold.cancelled.has(invocation.id)
-              ? { status: "cancelled" as const, cause: "deadline" as const }
-              : { status: "pending" as const }
-        })
-      },
-      cancellation: {
-        event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
-      }
-    })
-    const holdComponent = component<HoldState, undefined>({
-      name: "hold",
-      keys: {
-        prefixes: ["hold-request:", "hold-cancel:"],
-        keyOf: (event) => {
-          if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
-          if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
-          return undefined
-        }
-      },
-      initial: initialHoldState,
-      step: stepHoldState,
-      output: () => ({ view: undefined, transitions: [] })
-    })
-    const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
     const alarm = new ManualAlarmScheduler()
     const h = await createBunHost({
       database: path,
@@ -557,6 +560,42 @@ describe("the bun host", () => {
     expect(h.work()).toBe(0)
     await h.close()
     threadDb.close()
+  })
+
+  test("an alarm-only log repairs its missing cancellation", async () => {
+    const path = freshPath()
+    const alarm = new ManualAlarmScheduler()
+    const h = await createBunHost({
+      database: path,
+      actorFor: () => holdActor,
+      keyOf: holdActor.keyOf,
+      alarm
+    })
+    // A log written before the atomic alarm commits: the alarm fact landed, its cancellation did not.
+    await h.seed("caller", [
+      created("caller"),
+      {
+        type: "HoldRequested",
+        id: "hold-1",
+        text: "held",
+        call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt: 50 },
+        at: 1
+      } as Event,
+      { type: "AlarmFired", scheduledFor: 50, at: 60 } as Event
+    ])
+    await h.recover()
+    const repaired = await h.read("caller")
+    expect(repaired.filter((event) => event.type === "CancellationRequested")).toHaveLength(1)
+    expect(repaired.find((event) => event.type === "CancellationRequested")).toMatchObject({
+      request: "deadline/hold/hold-1/0/50",
+      cause: "deadline"
+    })
+    expect(repaired.some((event) => event.type === "HoldCancelled")).toBe(true)
+    expect(await h.resting()).toBe(true)
+    expect(alarm.pending).toEqual([])
+    await h.drive()
+    expect((await h.read("caller")).filter((event) => event.type === "CancellationRequested")).toHaveLength(1)
+    await h.close()
   })
 
   test("threads names every thread the log holds", async () => {
