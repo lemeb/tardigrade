@@ -48,7 +48,6 @@ const methodState = async (thread: string, call: string): Promise<unknown> => {
   return undefined
 }
 
-// Both deadline properties drive one cancellable hold actor.
 const hasHoldEvent = (events: ReadonlyArray<Event>, type: string, id: string): boolean =>
   events.some((event) => event.type === type && String((event as { readonly id?: unknown }).id) === id)
 const hold = actorMethod({

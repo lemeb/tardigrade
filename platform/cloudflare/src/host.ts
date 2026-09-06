@@ -230,7 +230,7 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
   const nextMethodDeadline = async (): Promise<number | undefined> => {
     return earliestDeadlineOf(await Effect.runPromise(events.read), methods)
   }
-  // recordAlarm commits the alarm fact and the deadline cancellations it crossed in one append (test/actor.workers.ts, "an alarm commits its deadline cancellation atomically").
+  // recordAlarm commits each alarm with its crossed deadline cancellations (test/actor.workers.ts, "an alarm commits its deadline cancellation atomically").
   const recordAlarm = async (at: number): Promise<void> => {
     const log = await Effect.runPromise(events.read)
     const deadline = earliestDeadlineOf(log, methods)

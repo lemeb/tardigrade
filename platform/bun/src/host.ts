@@ -595,7 +595,7 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
       const active = await runtimeOf(thread)
       if (active.alarm?.deadlineAt !== deadlineAt) return
       delete active.alarm
-      // The alarm callback commits the alarm fact and the deadline cancellations it crossed in one append, so the batch lands whole or not at all (host.test.ts, "an alarm commits its deadline cancellation atomically").
+      // synchronizeAlarm commits each alarm with its crossed deadline cancellations (host.test.ts, "an alarm commits its deadline cancellation atomically").
       const log = await active.runtime.runPromise(active.store.read)
       await appendTo(thread, [
         alarmFired({ scheduledFor: deadlineAt, at }),

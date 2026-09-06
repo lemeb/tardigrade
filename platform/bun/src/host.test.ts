@@ -106,7 +106,6 @@ const options = (path: string): BunHostOptions<never> => ({
   keyOf
 })
 
-// Both bun deadline properties drive one cancellable hold actor.
 const hasHoldEvent = (events: ReadonlyArray<Event>, type: string, id: string): boolean =>
   events.some((event) => event.type === type && String((event as { readonly id?: unknown }).id) === id)
 const hold = actorMethod({
@@ -518,7 +517,6 @@ describe("the bun host", () => {
     expect(alarm.pending).toEqual([50])
     expect(h.work()).toBe(0)
 
-    // A rejected cancellation insert aborts the whole batch, alarm fact included, and leaves the driver unmarked.
     const threadDb = new Database(bunThreadDatabasePath(path, "caller"))
     threadDb.exec(`CREATE TRIGGER reject_deadline_cancellation
       BEFORE INSERT ON events
@@ -531,7 +529,6 @@ describe("the bun host", () => {
     expect(h.work()).toBe(0)
     expect(alarm.pending).toEqual([])
 
-    // The aborted batch left the deadline uncrossed, so a clean retry commits alarm fact and cancellation together.
     await h.wake("caller")
     expect(alarm.pending).toEqual([50])
     threadDb.exec("DROP TRIGGER reject_deadline_cancellation")
@@ -553,7 +550,6 @@ describe("the bun host", () => {
     const path = freshPath()
     const alarm = new ManualAlarmScheduler()
     const h = await deadlineHost(path, alarm)
-    // A log written before the atomic alarm commits: the alarm fact landed, its cancellation did not.
     await h.seed("caller", [
       created("caller"),
       heldInvocation(),

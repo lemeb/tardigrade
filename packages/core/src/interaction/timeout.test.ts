@@ -31,8 +31,6 @@ const dispatched = (
   at
 })
 
-// One cancellable work method backs the selection and legacy-recovery properties: its invocation
-// runs until a WorkCompleted record settles it, and only a running invocation accepts cancellation.
 const work = legacyActorMethod({
   input: Schema.String,
   output: Schema.String,

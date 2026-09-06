@@ -142,7 +142,7 @@ const deadlineCancellationTransition = (invocation: InvocationRef, deadlineAt: n
   })]
 })
 
-// deadlineCancellationsAt projects the invocation deadlines an observed time has crossed into the same cancellation targets the caller path uses (timeout.test.ts, "cancellation selection projects one cancellation from an eligible invocation"; cancellation.test.ts, "the core event and key identify the target invocation independently of its requester").
+// deadlineCancellationsAt selects crossed deadlines for running cancellable invocations (timeout.test.ts, "cancellation selection projects one cancellation from an eligible invocation").
 const deadlineCancellationsAt = (
   log: ReadonlyArray<Event>,
   methods: ActorMethods,
@@ -162,7 +162,7 @@ const deadlineCancellationsAt = (
   })
 }
 
-// deadlineCancellationEventsAt constructs the durable cancellation requests one observed crossing commits alongside its alarm fact (timeout.test.ts, "cancellation selection projects one cancellation from an eligible invocation"; test/actor.workers.ts, "an alarm commits its deadline cancellation atomically").
+// deadlineCancellationEventsAt constructs durable requests for selected deadline cancellations (test/actor.workers.ts, "an alarm commits its deadline cancellation atomically").
 export const deadlineCancellationEventsAt = (
   log: ReadonlyArray<Event>,
   methods: ActorMethods,
@@ -189,7 +189,7 @@ export const methodTimeoutDerivation: CompleteTransitionDerivation = (log) => {
   })
 }
 
-// methodDeadlineCancellationDerivation projects one deadline cancellation per invocation a recorded alarm crossed, for logs written before the alarm handler committed them (timeout.test.ts, "legacy recovery derives an alarm's missing cancellation exactly once").
+// methodDeadlineCancellationDerivation repairs missing cancellations from recorded alarms (timeout.test.ts, "legacy recovery derives an alarm's missing cancellation exactly once").
 export const methodDeadlineCancellationDerivation = (methods: ActorMethods): CompleteTransitionDerivation => (log) => {
   const latestAlarmAt = alarmsOf(log).reduce<number | undefined>(
     (latest, alarm) => latest === undefined ? alarm.at : Math.max(latest, alarm.at),
