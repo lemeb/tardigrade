@@ -10,7 +10,7 @@ import { type ActorInvocationContext, invocationKey, sameInvocation, type Invoca
 
 import { recordedDispatchOf, terminalInvocationRefOf, terminalStorageKey, type RecordedDispatch } from "./records-compat"
 
-import { cancellationStateOf, initialMethodStates, reduceMethodStates } from "./state"
+import { cancellationStateOf, initialMethodStates, reduceMethodStates, type ActorMethodView } from "./state"
 import { type ActorMethods } from "../actor/method"
 
 export interface AlarmFiredFields {
@@ -142,6 +142,42 @@ const deadlineCancellationTransition = (invocation: InvocationRef, deadlineAt: n
   })]
 })
 
+// deadlineCancellationsAt selects crossed deadlines for running cancellable invocations (timeout.test.ts, "cancellation selection projects one cancellation from an eligible invocation").
+const deadlineCancellationsAt = (
+  log: ReadonlyArray<Event>,
+  methods: ActorMethods,
+  at: number
+): ReadonlyArray<InvocationDeadline> => {
+  const views = new Map<string, ActorMethodView<unknown>>()
+  return invocationDeadlinesOf(log).flatMap(({ invocation, deadlineAt }) => {
+    if (deadlineAt > at) return []
+    const method = methods[invocation.method]
+    if (method === undefined || method.cancellation === undefined || invocationSettled(log, invocation)) return []
+    let view = views.get(invocation.method)
+    if (view === undefined) {
+      view = replayProjection(method.projection, log)
+      views.set(invocation.method, view)
+    }
+    return cancellationStateOf(method, view, invocation) !== "running" ? [] : [{ invocation, deadlineAt }]
+  })
+}
+
+// deadlineCancellationEventsAt constructs durable requests for selected deadline cancellations (test/actor.workers.ts, "an alarm commits its deadline cancellation atomically").
+export const deadlineCancellationEventsAt = (
+  log: ReadonlyArray<Event>,
+  methods: ActorMethods,
+  at: number
+): ReadonlyArray<Event> =>
+  deadlineCancellationsAt(log, methods, at).map(({ invocation, deadlineAt }) =>
+    cancellationRequested({
+      request: `deadline/${invocation.method}/${invocation.id}/${invocation.epoch}/${deadlineAt}`,
+      invocation,
+      cause: "deadline",
+      deadlineAt,
+      at
+    })
+  )
+
 // methodTimeoutDerivation turns alarm facts into method terminals without reading a clock.
 export const methodTimeoutDerivation: CompleteTransitionDerivation = (log) => {
   const terminal = terminalCalls(log)
@@ -153,18 +189,15 @@ export const methodTimeoutDerivation: CompleteTransitionDerivation = (log) => {
   })
 }
 
-// methodDeadlineCancellationDerivation turns an accepted invocation deadline into the same durable cancellation used by callers.
+// methodDeadlineCancellationDerivation repairs missing cancellations from recorded alarms (timeout.test.ts, "legacy recovery derives an alarm's missing cancellation exactly once").
 export const methodDeadlineCancellationDerivation = (methods: ActorMethods): CompleteTransitionDerivation => (log) => {
-  const alarms = alarmsOf(log)
-  return invocationDeadlinesOf(log).flatMap(({ invocation, deadlineAt }) => {
-    const cancellation = methods[invocation.method]?.cancellation
-    if (cancellation === undefined || invocationSettled(log, invocation)) return []
-    const alarm = alarmFor(alarms, deadlineAt)
-    const method = methods[invocation.method]
-    if (alarm === undefined || method === undefined ||
-      cancellationStateOf(method, replayProjection(method.projection, log), invocation) !== "running") return []
-    return [deadlineCancellationTransition(invocation, deadlineAt)]
-  })
+  const latestAlarmAt = alarmsOf(log).reduce<number | undefined>(
+    (latest, alarm) => latest === undefined ? alarm.at : Math.max(latest, alarm.at),
+    undefined
+  )
+  if (latestAlarmAt === undefined) return []
+  return deadlineCancellationsAt(log, methods, latestAlarmAt)
+    .map(({ invocation, deadlineAt }) => deadlineCancellationTransition(invocation, deadlineAt))
 }
 
 /** @deprecated Use methodTimeoutDerivation. This compatibility name describes a complete-history transition derivation. */

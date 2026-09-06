@@ -19,7 +19,7 @@ import type { ThreadAllocation } from "@clavia/tardigrade-core/actor/allocation"
 import { formatThreadAddress, parseThreadAddress, type ThreadAddress, type ProviderEndpoint } from "@clavia/tardigrade-core/transport/endpoint"
 import type { Link } from "@clavia/tardigrade-core/transport/link"
 import { actorEventKeyOf, actorThreadsOf, type ActorThreadRecord, type ThreadRegistered, type ThreadRequested } from "@clavia/tardigrade-core/actor"
-import { alarmFired, earliestDeadlineOf } from "@clavia/tardigrade-core/interaction/timeout"
+import { alarmFired, deadlineCancellationEventsAt, earliestDeadlineOf } from "@clavia/tardigrade-core/interaction/timeout"
 import { methodIngressKeyOf } from "@clavia/tardigrade-core/interaction/invocation"
 import { type ActorMethods } from "@clavia/tardigrade-core/actor/method"
 import {
@@ -595,7 +595,12 @@ export const createBunHost = async <R = never>(options: BunHostOptions<R>): Prom
       const active = await runtimeOf(thread)
       if (active.alarm?.deadlineAt !== deadlineAt) return
       delete active.alarm
-      await appendTo(thread, [alarmFired({ scheduledFor: deadlineAt, at })])
+      // synchronizeAlarm commits each alarm with its crossed deadline cancellations (host.test.ts, "an alarm commits its deadline cancellation atomically").
+      const log = await active.runtime.runPromise(active.store.read)
+      await appendTo(thread, [
+        alarmFired({ scheduledFor: deadlineAt, at }),
+        ...(methods === undefined ? [] : deadlineCancellationEventsAt(log, methods, at))
+      ])
       driver.mark(thread)
       await drive()
     })

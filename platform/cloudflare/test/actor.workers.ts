@@ -1,10 +1,13 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test"
-import { Effect, ManagedRuntime } from "effect"
+import { Effect, ManagedRuntime, Schema } from "effect"
+import { actor, actorMethod, component } from "tardie"
+import type { Event } from "@clavia/tardigrade-core/event"
 import { beforeAll, describe, expect, test } from "vitest"
 import { makeActorClient } from "@clavia/tardigrade-client"
 import type { ModelCatalog } from "@clavia/tardigrade-client/contract"
 import { ModelCatalogRepository } from "@clavia/tardigrade-server/catalog-store"
-import { actorFromProjections } from "@clavia/tardigrade-core/runtime"
+import { actorFromProjections, actorRuntimeOf } from "@clavia/tardigrade-core/runtime"
+import { deadlineCancellationEventsAt } from "@clavia/tardigrade-core/interaction/timeout"
 import {
   backgroundTaskOwnerOf,
   DEFAULT_BACKGROUND_TASK_OWNER,
@@ -44,6 +47,64 @@ const methodState = async (thread: string, call: string): Promise<unknown> => {
   }
   return undefined
 }
+
+const hasHoldEvent = (events: ReadonlyArray<Event>, type: string, id: string): boolean =>
+  events.some((event) => event.type === type && String((event as { readonly id?: unknown }).id) === id)
+const hold = actorMethod({
+  input: Schema.Struct({ text: Schema.String }),
+  output: Schema.String,
+  event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
+  projection: {
+    initial: () => [] as ReadonlyArray<Event>,
+    step: (events, event) => [...events, event],
+    output: (events) => ({
+      currentEpoch: () => 0,
+      invocationState: (invocation) => !hasHoldEvent(events, "HoldRequested", invocation.id) ? undefined
+        : hasHoldEvent(events, "HoldCancelled", invocation.id)
+          ? { status: "cancelled" as const, cause: "deadline" as const }
+          : hasHoldEvent(events, "HoldCompleted", invocation.id)
+            ? { status: "completed" as const, output: "done" }
+            : { status: "pending" as const }
+    })
+  },
+  cancellation: {
+    event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
+  }
+})
+const holdComponent = component<undefined, undefined>({
+  name: "hold",
+  keys: {
+    prefixes: ["hold-request:", "hold-complete:", "hold-cancel:"],
+    keyOf: (event) => {
+      if (event.type === "HoldRequested") return `hold-request:${String((event as { readonly id?: unknown }).id)}`
+      if (event.type === "HoldCompleted") return `hold-complete:${String((event as { readonly id?: unknown }).id)}`
+      if (event.type === "HoldCancelled") return `hold-cancel:${String((event as { readonly id?: unknown }).id)}`
+      return undefined
+    }
+  },
+  initial: () => undefined,
+  step: () => undefined,
+  output: () => ({ view: undefined, transitions: [] })
+})
+const holdDeadlineActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
+const holdDeadlineRuntime = actorRuntimeOf(holdDeadlineActor)
+const heldInvocation = (deadlineAt: number): Event => ({
+  type: "HoldRequested",
+  id: "hold-1",
+  text: "held",
+  call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt },
+  at: deadlineAt - 100
+})
+const eventsOf = (events: ReadonlyArray<Event>, type: string) => events.filter((event) => event.type === type)
+const deadlineThreadHost = (state: DurableObjectState, thread: string) =>
+  createCloudflareThreadHost({
+    storage: state.storage,
+    actorName: "echo",
+    actorInstance: "main",
+    thread,
+    actor: holdDeadlineActor,
+    keyOf: holdDeadlineRuntime.keyOf
+  })
 
 beforeAll(async () => {
   const db = (env as Env).CATALOG_DB
@@ -274,6 +335,60 @@ describe("cloudflare actor", () => {
       scheduledFor: deadlineAt
     }))
   })
+
+  test("an alarm commits its deadline cancellation atomically", async () => {
+    await runInDurableObject(threadStub("deadline-atomicity"), async (_instance, state) => {
+      const host = await deadlineThreadHost(state, "ag.deadline-atomicity")
+      const deadlineAt = Date.now() - 1
+      await host.commitRoot(heldInvocation(deadlineAt))
+      await host.drive()
+      expect(eventsOf(await host.read(), "HoldRequested")).toHaveLength(1)
+      expect(eventsOf(await host.read(), "AlarmFired")).toEqual([])
+      expect(host.work()).toBe(0)
+      state.storage.sql.exec(`CREATE TRIGGER reject_deadline_cancellation
+        BEFORE INSERT ON events
+        WHEN NEW.key LIKE 'cx:%'
+        BEGIN SELECT RAISE(ABORT, 'reject deadline cancellation'); END`)
+      await expect(host.recordAlarm(Date.now())).rejects.toThrow()
+      expect(eventsOf(await host.read(), "AlarmFired")).toEqual([])
+      expect(eventsOf(await host.read(), "CancellationRequested")).toEqual([])
+      expect(host.work()).toBe(0)
+      state.storage.sql.exec("DROP TRIGGER reject_deadline_cancellation")
+      await host.recordAlarm(Date.now())
+      const afterAlarm = await host.read()
+      const alarmAt = afterAlarm.findIndex((event) => event.type === "AlarmFired")
+      expect(afterAlarm.findIndex((event) => event.type === "CancellationRequested")).toBeGreaterThan(alarmAt)
+      expect(alarmAt).toBeGreaterThanOrEqual(0)
+      expect(host.work()).toBe(1)
+      await host.drive()
+      expect(eventsOf(await host.read(), "HoldCancelled")).toHaveLength(1)
+      expect(await host.resting()).toBe(true)
+      expect(host.work()).toBe(0)
+      await host.close()
+    })
+  }, WORKER_INTEGRATION_TIMEOUT_MILLIS)
+
+  test("a stale deadline cancellation leaves a settled invocation unchanged", async () => {
+    await runInDurableObject(threadStub("stale-deadline-cancellation"), async (_instance, state) => {
+      const host = await deadlineThreadHost(state, "ag.stale-deadline-cancellation")
+      const invocation = { method: "hold", id: "hold-1", epoch: 0 }
+      const deadlineAt = Date.now() - 1
+      await host.commitRoot(heldInvocation(deadlineAt))
+      await host.drive()
+      const stale = deadlineCancellationEventsAt(await host.read(), { hold }, Date.now())
+      expect(stale).toHaveLength(1)
+      expect(stale[0]).toMatchObject({ type: "CancellationRequested", cause: "deadline", invocation })
+      await host.commitRoot({ type: "HoldCompleted", id: "hold-1", at: deadlineAt - 50 })
+      await host.drive()
+      for (const event of stale) await host.commitRoot(event)
+      await host.drive()
+      const afterStale = await host.read()
+      expect(eventsOf(afterStale, "HoldCompleted")).toHaveLength(1)
+      expect(eventsOf(afterStale, "HoldCancelled")).toEqual([])
+      expect(await host.resting()).toBe(true)
+      await host.close()
+    })
+  }, WORKER_INTEGRATION_TIMEOUT_MILLIS)
 
   test("the creation cache follows the record accepted by storage", async () => {
     const target = { actor: "echo", instance: "main", thread: "ag.creation-cache" }
