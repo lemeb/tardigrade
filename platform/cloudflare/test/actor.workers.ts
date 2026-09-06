@@ -467,6 +467,7 @@ describe("cloudflare actor", () => {
       }
       await dob.init("echo", "main", "ag.drive-retention")
       const { promise: synchronizing, resolve: admitSynchronization } = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<void>()
       let owed = 1
       let drains = 0
       let synchronizePasses = 0
@@ -479,16 +480,15 @@ describe("cloudflare actor", () => {
         resting: async () => owed === 0,
         nextMethodDeadline: async () => {
           synchronizePasses += 1
-          // The first synchronization blocks until the admission below has landed, so the
-          // second work item is owed while this drive is between its drain and its release.
-          if (synchronizePasses === 1) await synchronizing
+          if (synchronizePasses === 1) {
+            entered.resolve()
+            await synchronizing
+          }
           return undefined
         }
       }
       dob.kick(host)
-      for (let attempt = 0; attempt < 100 && synchronizePasses === 0; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 1))
-      }
+      await entered.promise
       const live = dob.driving
       owed = 2
       dob.kick(host)

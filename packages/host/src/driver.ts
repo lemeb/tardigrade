@@ -33,36 +33,6 @@ export interface ThreadDriver {
   readonly work: () => number
 }
 
-// retainActiveDrive attaches a live drive to the execution scope of the work that just arrived,
-// because a drive retained only by whichever request happened to start it can lose its owner
-// mid-drive (driver.test.ts, "a live drive is retained by each admitting scope").
-export const retainActiveDrive = (
-  active: Promise<void> | undefined,
-  retain: (task: Promise<void>) => void
-): boolean => {
-  if (active === undefined) return false
-  retain(active)
-  return true
-}
-
-// drainUntilResting keeps one drive live across the synchronize step that follows each drain,
-// so work admitted during that gap is settled by the same drive, and it releases the drive
-// only once no work remains (driver.test.ts, "a drive settles work admitted during
-// synchronization and releases at rest"). The release runs in the same synchronous step as the
-// final work check, so no admission can slip between the check and the release.
-export const drainUntilResting = async (
-  drain: () => Promise<void>,
-  synchronize: () => Promise<void>,
-  work: () => number,
-  release: () => void
-): Promise<void> => {
-  do {
-    await drain()
-    await synchronize()
-  } while (work() > 0)
-  release()
-}
-
 interface ThreadDriverOptions {
   readonly serve: (thread: string) => Promise<void>
   readonly pick?: (dirty: ReadonlySet<string>) => string

@@ -1,4 +1,3 @@
-import { drainUntilResting, retainActiveDrive } from "@clavia/tardigrade-host/driver"
 import { cloudflareRpcTransport } from "./transport/rpc"
 import { DurableObject } from "cloudflare:workers"
 import { Effect, Layer, Schema } from "effect"
@@ -261,31 +260,23 @@ export class ThreadDO extends DurableObject<Env> {
     this.kick(host)
   }
 
-  // kick starts reconciliation while the Durable Object is active and leaves its alarm armed until the host rests (test/actor.workers.ts, "a mounted actor exposes durable methods").
+  // kick retains each admission's drive through synchronization and releases at rest (tla/ActiveDrive.tla, AdmissionRetained and JoinedWorkDrained).
   private kick(host: CloudflareThreadHost): void {
-    if (retainActiveDrive(this.driving, (task) =>
-      retainBackgroundTask(this.ctx, this.backgroundTaskOwner, task))) return
-    const driving = (async () => {
-      try {
-        await drainUntilResting(
-          host.drive,
-          () => this.synchronizeAlarm(host),
-          host.work,
-          () => {
-            this.driving = undefined
-          }
-        )
-      } catch (cause) {
-        // The failed drive releases its slot here rather than in a trailing finally, so the
-        // next admission starts a fresh drive instead of joining a settled one. The slot
-        // cannot hold a successor yet: only this drive's own release or this catch clears it,
-        // and a new drive is only started into an empty slot.
-        this.driving = undefined
-        console.error("actor drive failed; the alarm remains armed", cause)
-      }
-    })()
-    this.driving = driving
-    retainBackgroundTask(this.ctx, this.backgroundTaskOwner, driving)
+    if (this.driving === undefined) {
+      this.driving = Promise.resolve().then(async () => {
+        try {
+          do {
+            await host.drive()
+            await this.synchronizeAlarm(host)
+          } while (host.work() > 0)
+        } catch (cause) {
+          console.error("actor drive failed; the alarm remains armed", cause)
+        } finally {
+          this.driving = undefined
+        }
+      })
+    }
+    retainBackgroundTask(this.ctx, this.backgroundTaskOwner, this.driving)
   }
 
   async append(thread: string, event: Event): Promise<boolean> {
