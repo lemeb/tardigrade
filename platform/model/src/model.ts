@@ -468,15 +468,18 @@ const deltaDelivery = (
   })
 
 // observed taps normalized text while preserving the stream consumed by the terminal accumulator.
+// onDelta is the synchronous seam the caller's own accumulator reads; delivery stays the host's
+// best-effort fan-out (model.test.ts, "react streams onDelta text with no observer configured").
 const observed = (
   stream: AsyncIterable<StreamChunk>,
   delivery: DeltaDelivery | undefined,
+  onDelta: ((delta: InferDelta) => void) | undefined,
   identity: InferRequest["identity"],
   logicalAttempt: string | undefined,
   physicalAttempt: string,
   model: { readonly provider: string; readonly model_id: string }
 ): AsyncIterable<StreamChunk> => {
-  if (delivery === undefined) return stream
+  if (delivery === undefined && onDelta === undefined) return stream
   if (logicalAttempt === undefined) throw new Error("an observed inference requires a logical attempt identity")
   let blockIndex = -1
   let sequence = 0
@@ -499,7 +502,8 @@ const observed = (
         sequence: sequence++,
         text: chunk.delta
       }
-      return delivery.offer(delta).pipe(Effect.asVoid)
+      if (onDelta !== undefined) onDelta(delta)
+      return delivery === undefined ? Effect.void : delivery.offer(delta).pipe(Effect.asVoid)
     }),
     Stream.toAsyncIterable
   )
@@ -593,6 +597,7 @@ export const infer = <const C extends ModelConfig>(
     rung: number,
     stats: { finish?: string },
     delivery: DeltaDelivery | undefined,
+    onDelta: ((delta: InferDelta) => void) | undefined,
     identity: InferRequest["identity"],
     physicalAttempt: string,
     signal?: AbortSignal
@@ -657,6 +662,7 @@ export const infer = <const C extends ModelConfig>(
       const normalized = observed(
         tapTokens(bounded(attempt.stream, bounds), held),
         delivery,
+        onDelta,
         identity,
         key,
         physicalAttempt,
@@ -712,7 +718,7 @@ export const infer = <const C extends ModelConfig>(
         "gen_ai.request.model": config.model,
         "gen_ai.provider.name": config.protocol === "bedrock-converse" ? "aws.bedrock" : (config.provider ?? config.protocol)
       }
-    })(function* (request: InferRequest, key?: string, signal?: AbortSignal) {
+    })(function* (request: InferRequest, key?: string, signal?: AbortSignal, onDelta?: (delta: InferDelta) => void) {
       // The retry ladder reads the wall clock to honour a provider's `Retry-After` date, and it
       // reads it from the Clock the caller supplied rather than the global one, so a test drives
       // the ladder without waiting on real time (model.test.ts, "infer: transient retry").
@@ -767,10 +773,10 @@ export const infer = <const C extends ModelConfig>(
             stats.rung = rung
             stats.attempts += 1
             const logicalAttempt = key ?? request.identity.turn
-            const physicalAttempt = delivery === undefined
+            const physicalAttempt = delivery === undefined && onDelta === undefined
               ? ""
               : options.physicalAttemptId?.(logicalAttempt) ?? randomPhysicalAttemptId(logicalAttempt)
-            const action = await attemptOnce(req, mode, key, ladder[rung]!, rung, stats, delivery, request.identity, physicalAttempt, signal)
+            const action = await attemptOnce(req, mode, key, ladder[rung]!, rung, stats, delivery, onDelta, request.identity, physicalAttempt, signal)
             remember(action.usage, true)
             return served(withSpend(action, spentOf(parts, missed)), action.endpoint ?? endpointOf(config, undefined))
           } catch (e) {
