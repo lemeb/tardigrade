@@ -1,3 +1,4 @@
+import { drainUntilResting, retainActiveDrive } from "@clavia/tardigrade-host/driver"
 import { cloudflareRpcTransport } from "./transport/rpc"
 import { DurableObject } from "cloudflare:workers"
 import { Effect, Layer, Schema } from "effect"
@@ -262,23 +263,29 @@ export class ThreadDO extends DurableObject<Env> {
 
   // kick starts reconciliation while the Durable Object is active and leaves its alarm armed until the host rests (test/actor.workers.ts, "a mounted actor exposes durable methods").
   private kick(host: CloudflareThreadHost): void {
-    if (this.driving !== undefined) return
-    let failed = false
+    if (retainActiveDrive(this.driving, (task) =>
+      retainBackgroundTask(this.ctx, this.backgroundTaskOwner, task))) return
     const driving = (async () => {
       try {
-        await host.drive()
-        await this.synchronizeAlarm(host)
+        await drainUntilResting(
+          host.drive,
+          () => this.synchronizeAlarm(host),
+          host.work,
+          () => {
+            this.driving = undefined
+          }
+        )
       } catch (cause) {
-        failed = true
+        // The failed drive releases its slot here rather than in a trailing finally, so the
+        // next admission starts a fresh drive instead of joining a settled one. The slot
+        // cannot hold a successor yet: only this drive's own release or this catch clears it,
+        // and a new drive is only started into an empty slot.
+        this.driving = undefined
         console.error("actor drive failed; the alarm remains armed", cause)
       }
     })()
     this.driving = driving
     retainBackgroundTask(this.ctx, this.backgroundTaskOwner, driving)
-    void driving.finally(() => {
-      if (this.driving === driving) this.driving = undefined
-      if (!failed && host.work() > 0) this.kick(host)
-    })
   }
 
   async append(thread: string, event: Event): Promise<boolean> {

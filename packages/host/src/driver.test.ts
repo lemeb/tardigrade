@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test"
 import {
   createThreadDriver,
   DEFAULT_MAX_CONCURRENT_THREADS,
-  driverPolicyOf
+  drainUntilResting,
+  driverPolicyOf,
+  retainActiveDrive
 } from "./driver"
 
 const gate = (): { readonly promise: Promise<void>; readonly open: () => void } => {
@@ -129,5 +131,53 @@ describe("thread driver", () => {
     await driver.drain()
     expect(attempts).toBe(2)
     expect(driver.resting()).toBe(true)
+  })
+
+  test("a live drive is retained by each admitting scope", () => {
+    const retained: Array<Promise<void>> = []
+    const retain = (task: Promise<void>): void => {
+      retained.push(task)
+    }
+    expect(retainActiveDrive(undefined, retain)).toBe(false)
+    const drive = Promise.resolve()
+    expect(retainActiveDrive(drive, retain)).toBe(true)
+    expect(retainActiveDrive(drive, retain)).toBe(true)
+    expect(retained).toEqual([drive, drive])
+  })
+
+  test("a drive settles work admitted during synchronization and releases at rest", async () => {
+    const passes: string[] = []
+    let owed = 1
+    const driving = drainUntilResting(
+      async () => {
+        owed = 0
+        passes.push("drain")
+      },
+      async () => {
+        passes.push("synchronize")
+        if (passes.length === 2) owed = 2
+      },
+      () => owed,
+      () => {
+        passes.push("release")
+      }
+    )
+    await driving
+    expect(passes).toEqual(["drain", "synchronize", "drain", "synchronize", "release"])
+  })
+
+  test("a failed drive surfaces its failure without releasing", async () => {
+    let released = false
+    await expect(drainUntilResting(
+      async () => {
+        throw new Error("drive failed")
+      },
+      async () => {},
+      () => 1,
+      () => {
+        released = true
+      }
+    )).rejects.toThrow("drive failed")
+    expect(released).toBe(false)
   })
 })
