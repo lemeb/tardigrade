@@ -1,12 +1,12 @@
 import { Effect } from "effect"
-import type { ThreadAddress, ProviderEndpoint } from "@clavia/tardigrade-core/communication/endpoint"
-import type { MessageReceived } from "@clavia/tardigrade-core/communication/message"
+import type { ThreadAddress, ProviderEndpoint } from "@clavia/tardigrade-core/transport/endpoint"
+import type { MessageReceived } from "@clavia/tardigrade-core/interaction/provider-message"
 import {
   channelOf,
   type Channel,
   type ChannelProvider,
   type ProviderReceipt
-} from "@clavia/tardigrade-host/communication/channel"
+} from "@clavia/tardigrade-host/transport/channel"
 
 export const TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 export const TELEGRAM_SECRET_TOKEN_HEADER = "x-telegram-bot-api-secret-token"

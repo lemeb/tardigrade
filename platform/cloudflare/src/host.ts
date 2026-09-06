@@ -3,30 +3,30 @@ import { KeyValueStore } from "effect/unstable/persistence"
 import { SqliteClient } from "@effect/sql-sqlite-do"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import { EventLog, eventLogFrom, type ThreadEventRow } from "@clavia/tardigrade-core/log"
-import { mappedDirectory } from "@clavia/tardigrade-core/communication/directory"
-import { Router, directoryRoute, sendThrough, type TransportRoute } from "@clavia/tardigrade-core/communication/router"
-import type { Transport } from "@clavia/tardigrade-core/communication/transport"
-import { isActorEnvelope, isProviderEnvelope, linkedEventOf, type ActorEnvelope, type Envelope } from "@clavia/tardigrade-core/communication/envelope"
-import { formatThreadAddress, type ThreadAddress, type ProviderEndpoint } from "@clavia/tardigrade-core/communication/endpoint"
-import type { Link } from "@clavia/tardigrade-core/communication/link"
-import {
-  alarmFired,
-  earliestDeadlineOf,
-  methodIngressKeyOf,
-  type ActorInvocationContext,
-  type ActorMethods
-} from "@clavia/tardigrade-core/method"
+import { mappedDirectory } from "@clavia/tardigrade-core/transport/directory"
+import { Router, directoryRoute, sendThrough, type TransportRoute } from "@clavia/tardigrade-core/transport/router"
+import type { Transport } from "@clavia/tardigrade-core/transport/transport"
+import { isActorEnvelope, isProviderEnvelope, type ActorEnvelope, type Envelope } from "@clavia/tardigrade-core/interaction/envelope"
+import { receivedEventOf } from "@clavia/tardigrade-core/interaction"
+import { ThreadAllocator, reserveRootThread } from "@clavia/tardigrade-core/actor/allocation"
+import { initializingThreadAllocator } from "@clavia/tardigrade-host/allocation"
+import { formatThreadAddress, type ThreadAddress, type ProviderEndpoint } from "@clavia/tardigrade-core/transport/endpoint"
+import type { Link } from "@clavia/tardigrade-core/transport/link"
+import { alarmFired, earliestDeadlineOf } from "@clavia/tardigrade-core/interaction/timeout"
+import { methodIngressKeyOf } from "@clavia/tardigrade-core/interaction/invocation"
+import { type ActorMethods } from "@clavia/tardigrade-core/actor/method"
 import {
   EffectInterruptions,
   Self,
   createActorReconciler,
+  actorRuntimeOf,
   effectInterruptionRegistry,
   restingActor,
-  type Actor
+  type ActorSource as Actor
 } from "@clavia/tardigrade-core/runtime"
 import { traceparentOf } from "@clavia/tardigrade-core/log/trace"
-import { sameThreadAddress, threadCreated, threadCreatedForDelivery, threadKeys, type ThreadLineage } from "@clavia/tardigrade-core/thread"
-import { providerTransportFrom, type Provider } from "@clavia/tardigrade-host/communication/provider"
+import { sameThreadAddress, threadCreated, threadCreatedForDelivery, threadKeys, type ThreadLineage } from "@clavia/tardigrade-core/interaction/relations"
+import { providerTransportFrom, type Provider } from "@clavia/tardigrade-host/transport/provider"
 import { createThreadDriver } from "@clavia/tardigrade-host/driver"
 import { CommitDispatcher, type CommitObserver } from "@clavia/tardigrade-host/commit"
 import type { HostPorts } from "@clavia/tardigrade-host/host"
@@ -40,7 +40,9 @@ type LayersFor<R> = [Exclude<R, CloudflarePorts>] extends [never]
   : { readonly layers: CloudflareThreadEnv<R> }
 
 export type CloudflareThreadHostOptions<R> = {
+  readonly initializeRoot?: (target: ThreadAddress, at: number) => Promise<void>
   readonly storage: DurableObjectStorage
+  readonly threadAllocator?: typeof ThreadAllocator.Service
   readonly actorName: string
   readonly actorInstance: string
   readonly thread: string
@@ -60,6 +62,7 @@ export interface CloudflareThreadHost {
   readonly commit: (envelope: Envelope<unknown, Event, ThreadAddress>) => Promise<void>
   readonly stage: (envelope: Envelope<unknown, Event, ThreadAddress>) => Promise<void>
   readonly commitRoot: (event: Event) => Promise<void>
+  readonly initializeRoot: (at: number) => Promise<void>
   readonly stageRoot: (event: Event) => Promise<void>
   readonly publishStaged: () => void
   readonly drive: () => Promise<void>
@@ -75,6 +78,11 @@ export interface CloudflareThreadHost {
 // createCloudflareThreadHost binds one actor thread to Effect SQL over its Durable Object storage.
 export async function createCloudflareThreadHost<R = never>(options: CloudflareThreadHostOptions<R>): Promise<CloudflareThreadHost> {
   const identity = { actor: options.actorName, instance: options.actorInstance, thread: options.thread }
+  const allocator: typeof ThreadAllocator.Service = options.threadAllocator ?? {
+    allocate: (request) => request.kind === "root" && request.key === undefined &&
+      request.coordinate.actor === identity.actor && request.coordinate.instance === identity.instance && request.coordinate.thread === identity.thread
+      ? Effect.succeed(identity) : Effect.die(new Error("thread allocation requires an actor directory"))
+  }
   const methods = "methods" in options.actor
     ? (options.actor as Actor<R> & { readonly methods: ActorMethods }).methods
     : undefined
@@ -107,15 +115,16 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
     event: Event,
     lineage: ThreadLineage | undefined,
     link?: Link<unknown, ThreadAddress>,
-    call?: ActorInvocationContext,
-    flush = true
+    call?: unknown,
+    flush = true,
+    allocated = false
   ): Effect.Effect<void> => {
     const address = formatThreadAddress(target)
     return Effect.gen(function* () {
       if (!sameThreadAddress(target, identity)) {
         return yield* Effect.die(new Error(`delivery target ${address} does not match thread ${formatThreadAddress(identity)}`))
       }
-      if (options.keyOf !== undefined && options.keyOf(event) === undefined && event.type !== "MessageReceived") {
+      if (!allocated && options.keyOf !== undefined && options.keyOf(event) === undefined && event.type !== "MessageReceived") {
         return yield* Effect.die(
           new Error(`unkeyed cross-thread event "${event.type}" to ${address}: every delivered event names its occurrence in its package's key fragment`)
         )
@@ -130,15 +139,18 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
         creationLoaded = true
       }
       const created = threadCreatedForDelivery(creation === undefined ? [] : [creation], target, lineage, link?.source)
-      const landed = link !== undefined && (stamped.type === "MessageReceived" || call !== undefined)
-        ? linkedEventOf({ link, event: stamped, ...(call === undefined ? {} : { call }) })
-        : stamped
+      if (allocated && created?.parent !== undefined) return yield* Effect.die(new Error("a child thread cannot be recreated as a root"))
+      const landed = receivedEventOf({ target, event: stamped, ...(link === undefined ? {} : { link }), ...(call === undefined ? {} : { call }) })
+      if (created === undefined && lineage === undefined && !allocated) {
+        yield* reserveRootThread(target).pipe(Effect.provideService(ThreadAllocator, allocator))
+      }
       const at = (event as { readonly at?: unknown }).at
       if (created === undefined && (typeof at !== "number" || !Number.isFinite(at))) {
         return yield* Effect.die(new Error(`first thread event "${event.type}" must carry a finite at`))
       }
       const opened = created === undefined ? threadCreated(target, lineage, at as number) : undefined
-      const result = yield* events.append(opened === undefined ? [landed] : [opened, landed])
+      const result = yield* events.append(allocated ? (created === undefined ? [landed] : [])
+        : opened === undefined ? [landed] : [opened, landed])
       if (opened !== undefined) {
         const first = yield* events.first
         creation = threadCreatedForDelivery(first === undefined ? [] : [first], target, lineage, link?.source)
@@ -183,11 +195,20 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
     Layer.succeed(EffectInterruptions, interruptions),
     router,
     workspace,
-    Layer.succeed(Self, identity)
+    Layer.succeed(Self, identity),
+    Layer.succeed(ThreadAllocator, initializingThreadAllocator(
+      allocator,
+      options.initializeRoot ?? ((target, at) => {
+        if (target.actor !== identity.actor || target.instance !== identity.instance || target.thread !== identity.thread) {
+          return Promise.reject(new Error("root initialization requires the owning host"))
+        }
+        return Effect.runPromise(commitEffect(identity, threadCreated(identity, undefined, at), undefined, undefined, undefined, true, true))
+      })
+    ))
   )
   const layers = (options.layers ?? Layer.empty as unknown as CloudflareThreadEnv<R>)
     .pipe(Layer.provideMerge(ports)) as Layer.Layer<R | EventLog>
-  const reconciler = createActorReconciler(options.actor)
+  const reconciler = createActorReconciler(actorRuntimeOf(options.actor))
   let reconcilerSettled = false
   const driver = createThreadDriver({
     serve: async (thread) => {
@@ -232,6 +253,7 @@ export async function createCloudflareThreadHost<R = never>(options: CloudflareT
     commit: (envelope) => Effect.runPromise(commitEffect(envelope.link.target, envelope.event, envelope.lineage, envelope.link, envelope.call)),
     stage: (envelope) => Effect.runPromise(commitEffect(envelope.link.target, envelope.event, envelope.lineage, envelope.link, envelope.call, false)),
     commitRoot: (event) => Effect.runPromise(commitEffect(identity, event, undefined)),
+    initializeRoot: (at) => Effect.runPromise(commitEffect(identity, threadCreated(identity, undefined, at), undefined, undefined, undefined, true, true)),
     stageRoot: (event) => Effect.runPromise(commitEffect(identity, event, undefined, undefined, undefined, false)),
     publishStaged: () => {
       if (stagedHead === 0) return

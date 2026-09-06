@@ -1,13 +1,13 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 import { Effect } from "effect"
-import type { ThreadAddress, ProviderEndpoint } from "@clavia/tardigrade-core/communication/endpoint"
-import type { MessageReceived } from "@clavia/tardigrade-core/communication/message"
+import type { ThreadAddress, ProviderEndpoint } from "@clavia/tardigrade-core/transport/endpoint"
+import type { MessageReceived } from "@clavia/tardigrade-core/interaction/provider-message"
 import {
   channelOf,
   type Channel,
   type ChannelProvider,
   type ProviderReceipt
-} from "@clavia/tardigrade-host/communication/channel"
+} from "@clavia/tardigrade-host/transport/channel"
 
 export const SLACK_API_BASE_URL = "https://slack.com/api"
 export const SLACK_SIGNATURE_HEADER = "x-slack-signature"

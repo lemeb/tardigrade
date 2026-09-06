@@ -1,7 +1,12 @@
 import { Cause, Clock, Context, Effect, Option, type Tracer } from "effect"
-import type { ActorInvocation, ActorMethodCancellationState } from "@clavia/tardigrade-core/method"
-import { cancelsInvocation } from "@clavia/tardigrade-core/method/cancellation"
-import type { ThreadAddress } from "@clavia/tardigrade-core/communication/endpoint"
+import { actorRuntimeOf, type ActorSource } from "./actor"
+import { InvocationScope, InvocationSuspended } from "../interaction/execution"
+import { ThreadAllocationScope } from "../actor/allocation"
+import { actorInvocationContextOf } from "../interaction/invocation"
+import type { InvocationRef } from "@clavia/tardigrade-core/interaction/invocation"
+import type { ActorMethodCancellationState } from "@clavia/tardigrade-core/interaction/state"
+import { cancelsInvocation } from "@clavia/tardigrade-core/interaction/cancellation"
+import type { ThreadAddress } from "@clavia/tardigrade-core/transport/endpoint"
 import type { ExternalEffect } from "@clavia/tardigrade-core/effect"
 import type { Event } from "@clavia/tardigrade-core/event"
 import { EventLog } from "@clavia/tardigrade-core/log"
@@ -10,7 +15,7 @@ import type { Projection } from "@clavia/tardigrade-core/projection"
 import type { ErasedTransitionProjection, Transition } from "@clavia/tardigrade-core/transition"
 
 // Actor runtime gives one log a single writer and derives all state from that log
-// (tla/runtime/Projection.tla). The platform serializes sends per actor.
+// (tla/projection/Projection.tla). The platform serializes sends per actor.
 
 // Self is the current actor's own address, bound by the platform per thread.
 export class Self extends Context.Service<Self, ThreadAddress>()("tardigrade/Self") {}
@@ -48,7 +53,7 @@ export interface Actor<R = never> {
   readonly keyOf: (e: Event) => string | undefined
   readonly cancellationOf?: (
     events: ReadonlyArray<Event>,
-    invocation: ActorInvocation
+    invocation: InvocationRef
   ) => ActorMethodCancellationState | undefined
   readonly cancellationResiduals?: (
     events: ReadonlyArray<Event>
@@ -59,8 +64,8 @@ export interface Actor<R = never> {
 // ActorProjectionOutput contains ordinary work and cancellation queries derived from actor state.
 export interface ActorProjectionOutput<R = never> {
   readonly continuations: ReadonlyArray<Transition<never, R>>
-  readonly cancellationOf: (invocation: ActorInvocation) => ActorMethodCancellationState | undefined
-  readonly suppresses: (invocation: ActorInvocation) => boolean
+  readonly cancellationOf: (invocation: InvocationRef) => ActorMethodCancellationState | undefined
+  readonly suppresses: (invocation: InvocationRef) => boolean
   readonly residuals: ReadonlyArray<Transition<never, R>> | undefined
 }
 
@@ -188,12 +193,35 @@ const runExternalEffect = <R>(
     const unregister = interrupts === undefined || Option.isNone(registry)
       ? () => {}
       : registry.value.register(interrupts, controller)
+    const action = transition.invocation === undefined
+      ? transition.act(transition.input, controller.signal)
+      : Effect.gen(function* () {
+          const log = yield* EventLog
+          const context = actorInvocationContextOf(yield* log.read, transition.invocation!) ?? { invocation: transition.invocation! }
+          const self = yield* Effect.serviceOption(Self)
+          let allocation = 0
+          return yield* transition.act(transition.input, controller.signal).pipe(
+            Effect.provideService(InvocationScope, { context, signal: controller.signal }),
+            Effect.provideService(ThreadAllocationScope, {
+              key: (explicit) => {
+                if (Option.isNone(self)) throw new Error("unnamed allocation requires the caller coordinate")
+                return JSON.stringify([
+                  self.value.actor, self.value.instance, self.value.thread,
+                  context.invocation.method, context.invocation.id, context.invocation.epoch,
+                  transition.key, explicit === undefined ? ["position", allocation++] : ["key", explicit]
+                ])
+              }
+            })
+          )
+        })
     return yield* Effect.raceFirst(
-      transition.act(transition.input, controller.signal),
+      action,
       interruptedBy(controller.signal)
     ).pipe(
       Effect.catchCause((cause) =>
         controller.signal.aborted && Cause.hasInterruptsOnly(cause)
+          ? Effect.succeed([])
+          : cause.reasons.length > 0 && cause.reasons.every((reason) => Cause.isDieReason(reason) && reason.defect instanceof InvocationSuspended)
           ? Effect.succeed([])
           : Effect.failCause(cause)
       ),
@@ -202,7 +230,8 @@ const runExternalEffect = <R>(
   })
 
 // enabled returns derived transitions whose keys the log does not record.
-export const enabled = <R>(a: Actor<R>, events: ReadonlyArray<Event>): ReadonlyArray<Transition<never, R>> => {
+export const enabled = <R>(source: ActorSource<R>, events: ReadonlyArray<Event>): ReadonlyArray<Transition<never, R>> => {
+  const a = actorRuntimeOf(source)
   const recorded = recordedKeys(events, a.keyOf)
   const states = new Map<ErasedTransitionProjection<R>, unknown>()
   let actorState = a.projection?.initial()
@@ -255,15 +284,15 @@ const enabledFrom = <R>(
 }
 
 // restingActor reports whether the log enables no transition
-// (tla/runtime/Driver.tla, Accounting).
-export const restingActor = <R>(a: Actor<R>, events: ReadonlyArray<Event>): boolean =>
+// (packages/host/tla/Driver.tla, Accounting).
+export const restingActor = <R>(a: ActorSource<R>, events: ReadonlyArray<Event>): boolean =>
   enabled(a, events).length === 0
 
 // settleActor attempts enabled transitions until the actor rests. Any log movement starts a fresh
 // output before another transition fires (actor.properties.test.ts, "a committed intent
 // invalidates every remaining transition from its snapshot"; tla/runtime/Coherence.tla,
 // NoSuppressedCommit). A fire may commit, advance, block, or wedge; a wedge dies, and the platform
-// alarm re-drives blocked work (tla/runtime/Driver.tla, EventuallyServed).
+// alarm re-drives blocked work (packages/host/tla/Driver.tla, EventuallyServed).
 export interface ActorReconciler<R> {
   readonly settle: Effect.Effect<void, never, EventLog | R>
   // isResting reports the result of the last completed settlement. A host must also account for work appended since that settlement.
@@ -271,8 +300,9 @@ export interface ActorReconciler<R> {
 }
 
 // createActorReconciler retains a sound projection and advances it from the durable watermark.
-// One instance belongs to one actor activation (tla/runtime/IncrementalProjection.tla, CacheSound).
-export const createActorReconciler = <R>(a: Actor<R>): ActorReconciler<R> => {
+// One instance belongs to one actor activation (tla/projection/IncrementalProjection.tla, CacheSound).
+export const createActorReconciler = <R>(source: ActorSource<R>): ActorReconciler<R> => {
+  const a = actorRuntimeOf(source)
   let cache: ProjectionCache<R> | undefined
   let resting = false
   const synchronize = (log: Context.Service.Shape<typeof EventLog>) => Effect.gen(function* () {
@@ -374,11 +404,11 @@ export const createActorReconciler = <R>(a: Actor<R>): ActorReconciler<R> => {
 }
 
 // settleActor attempts enabled transitions with a cursor scoped to this settlement.
-export const settleActor = <R>(a: Actor<R>): Effect.Effect<void, never, EventLog | R> =>
+export const settleActor = <R>(a: ActorSource<R>): Effect.Effect<void, never, EventLog | R> =>
   createActorReconciler(a).settle
 
 // send appends one event and settles the actor.
-export const send = <R>(a: Actor<R>, event: Event): Effect.Effect<void, never, EventLog | R> =>
+export const send = <R>(a: ActorSource<R>, event: Event): Effect.Effect<void, never, EventLog | R> =>
   Effect.gen(function* () {
     const log = yield* EventLog
     yield* log.append([event])

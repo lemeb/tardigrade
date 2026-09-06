@@ -1,4 +1,5 @@
 import { Clock, Context, Data, Effect, Layer } from "effect"
+import { actorRuntimeOf } from "@clavia/tardigrade-core/runtime"
 import { FetchHttpClient } from "effect/unstable/http"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import { createHash } from "node:crypto"
@@ -9,10 +10,10 @@ import { pathToFileURL } from "node:url"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import type { ActorThreadRecord } from "@clavia/tardigrade-core/actor"
 import type { ThreadEventRow } from "@clavia/tardigrade-core/log"
-import type { Envelope } from "@clavia/tardigrade-core/communication/envelope"
-import type { Directory } from "@clavia/tardigrade-core/communication/directory"
-import { Ingress, ingressFrom } from "@clavia/tardigrade-host/communication/ingress"
-import type { Provider } from "@clavia/tardigrade-host/communication/provider"
+import type { Envelope } from "@clavia/tardigrade-core/interaction/envelope"
+import type { Directory } from "@clavia/tardigrade-core/transport/directory"
+import { Ingress, ingressFrom } from "@clavia/tardigrade-host/transport/ingress"
+import type { Provider } from "@clavia/tardigrade-host/transport/provider"
 import {
   applyModelPolicy,
   ACTOR_ARTIFACT_VERSION,
@@ -30,6 +31,8 @@ import {
 } from "tardie"
 import type { Action } from "tardie/log/events"
 import { createBunHost, type BunHost, type BunHostOptions } from "@clavia/tardigrade-bun/host"
+import { ThreadAllocator } from "@clavia/tardigrade-core/actor/allocation"
+import type { ThreadCoordinate } from "@clavia/tardigrade-core/actor/coordinate"
 import { openBunActorRegistry } from "@clavia/tardigrade-bun/registry"
 import { infer } from "@clavia/tardigrade-model/model"
 import { modelAdapters, type ModelAdapter, type ModelAdapterRegistry } from "@clavia/tardigrade-model/adapter"
@@ -82,6 +85,7 @@ export class ActorPushRefused extends Data.TaggedError("ActorPushRefused")<{
 }> {}
 
 export interface ActorThreads {
+  readonly allocateRoot: (name?: string) => Effect.Effect<ThreadCoordinate>
   readonly methods: ActorMethods
   readonly sqlite: string
   readonly append: (id: string, event: Event) => Effect.Effect<void>
@@ -325,6 +329,8 @@ const layerThread = (
   )
 
 export interface ThreadsOptions {
+  readonly allocation?: BunHostOptions<never>["allocation"]
+  readonly threadAllocator?: typeof ThreadAllocator.Service
   // The model seam. Absent, the binding is derived from ServerConfig; present, it replaces that
   // derivation whole, which is how a test runs a scripted mind with no credentials
   // (host.test.ts). It is the one seam because Infer is the one place a turn leaves the process.
@@ -367,8 +373,6 @@ const definitionOf = async (modulePath: string, expected: ActorArtifactManifest)
     throw new Error(`actor artifact name does not match ${JSON.stringify(expected.name)}`)
   }
   if (
-    !Array.isArray(candidate.projections) ||
-    typeof candidate.keyOf !== "function" ||
     !Array.isArray(candidate.components)
   ) {
     throw new Error("actor artifact does not contain an Actor")
@@ -400,7 +404,9 @@ const runtimeOf = async <R>(
   thread: ReturnType<typeof layerThread>,
   providers: ReadonlyArray<Provider>,
   maxConcurrentThreads: number,
-  layersFor?: ActorThreadLayersFor<R>
+  layersFor?: ActorThreadLayersFor<R>,
+  threadAllocator?: typeof ThreadAllocator.Service,
+  allocation?: BunHostOptions<never>["allocation"]
 ): Promise<ActorRuntime> => {
   const actor = definition
   const environmentFor = ((candidate: string) => {
@@ -408,6 +414,8 @@ const runtimeOf = async <R>(
     return application === undefined ? thread : Layer.mergeAll(thread, application)
   }) as NonNullable<BunHostOptions<R>["layersFor"]>
   const host: BunHost = await createBunHost<R>({
+    ...(allocation === undefined ? {} : { allocation }),
+    ...(threadAllocator === undefined ? {} : { threadAllocator }),
     database,
     actorName: summary.name,
     actorInstance,
@@ -415,7 +423,7 @@ const runtimeOf = async <R>(
     layersFor: environmentFor,
     providers,
     driver: { maxConcurrentThreads },
-    keyOf: (event) => actor.keyOf?.(event)
+    keyOf: actorRuntimeOf(actor).keyOf
   })
   let driving: Promise<void> | undefined
   let follow = false
@@ -480,6 +488,12 @@ const runtimeOf = async <R>(
       yield* Effect.promise(() => host.commit(placed))
     })
   const threads: ActorThreads = {
+    allocateRoot: (name) => Effect.promise(() => host.allocate({
+      kind: "root", coordinate: { actor: summary.name, instance: actorInstance, thread: name ?? "" },
+      // Unnamed HTTP requests create independent allocations.
+      // @effect-diagnostics-next-line cryptoRandomUUIDInEffect:off
+      ...(name === undefined ? { key: crypto.randomUUID() } : {})
+    })),
     methods: definition.methods,
     sqlite: database === ":memory:" ? database : resolve(database),
     append: (id, event) =>
@@ -519,7 +533,7 @@ const runtimeOf = async <R>(
   }
 }
 
-type ActorThreadsBaseOptions = Pick<ThreadsOptions, "infer" | "inferenceObserver" | "modelAdapters" | "providers">
+type ActorThreadsBaseOptions = Pick<ThreadsOptions, "infer" | "inferenceObserver" | "modelAdapters" | "providers" | "threadAllocator" | "allocation">
 
 export type ActorThreadsOptions<R> = ActorThreadsBaseOptions & ([ActorApplicationRequirements<R>] extends [never]
   ? { readonly layersFor?: ActorThreadLayersFor<R> }
@@ -570,7 +584,8 @@ export const layerActorThreads = <R>(
         thread,
         options.providers ?? [],
         config.maxConcurrentThreads,
-        options.layersFor
+        options.layersFor,
+        options.threadAllocator, options.allocation
       ).then((runtime) => {
         runtimes.set(id, runtime)
         opening.delete(id)
@@ -701,7 +716,9 @@ const make = (options: ThreadsOptions) =>
         database,
         thread,
         options.providers ?? [],
-        config.maxConcurrentThreads
+        config.maxConcurrentThreads,
+        undefined,
+        options.threadAllocator, options.allocation
       )
       runtimes.set(summary.name, runtime)
       await runRegistry(registry.put(summary))
@@ -719,7 +736,9 @@ const make = (options: ThreadsOptions) =>
         actorDatabasePath(config.db, id),
         thread,
         options.providers ?? [],
-        config.maxConcurrentThreads
+        config.maxConcurrentThreads,
+        undefined,
+        options.threadAllocator, options.allocation
       ).then((runtime) => {
         instances.set(id, runtime)
         openingInstances.delete(id)

@@ -1,12 +1,14 @@
 import { Effect, Layer, Schema } from "effect"
+import { actorRuntimeOf } from "@clavia/tardigrade-core/runtime"
 import { KeyValueStore } from "effect/unstable/persistence"
-import { ChildCreated } from "@clavia/tardigrade-core/thread"
+import { ChildCreated } from "@clavia/tardigrade-core/interaction/relations"
+import { prepareInvocation } from "@clavia/tardigrade-core/interaction/prepare"
+import { formatThreadAddress, parseThreadAddress } from "@clavia/tardigrade-core/transport/endpoint"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import type { Actor } from "@clavia/tardigrade-core/actor"
 import { jsSandboxFor } from "@clavia/tardigrade-code/sandbox/defaults"
 import { createHost, type Host, type HostOptions, type ThreadEnv } from "@clavia/tardigrade-host/host"
 import {
-  boundaryOf,
   Infer,
   NativeOutputSupport,
   type AgentR,
@@ -40,7 +42,7 @@ type TestR = AgentR | NativeOutputSupport
 
 export interface ActorScenario {
   readonly host: Host
-  readonly enqueue: (brief: string) => string
+  readonly enqueue: (brief: string) => Promise<string>
   readonly drive: () => Promise<void>
   readonly result: (turn: string) => { readonly turn: string; readonly output?: string; readonly error?: string }
   readonly run: (brief: string) => Promise<{ readonly turn: string; readonly output?: string; readonly error?: string }>
@@ -70,31 +72,34 @@ export const actorScenario = (
     actorName: "mem",
     actorFor: () => assembled,
     layersFor,
-    keyOf: assembled.keyOf,
+    keyOf: actorRuntimeOf(assembled).keyOf,
     ...(options.pick === undefined ? {} : { pick: options.pick }),
     ...(options.driver === undefined ? {} : { driver: options.driver })
   })
 
   let sequence = 0
-  const enqueue = (brief: string): string => {
+  const message = assembled.methods.message
+  if (message === undefined) throw new Error("actor scenarios require a message method")
+  const enqueue = async (brief: string): Promise<string> => {
     const turn = `run-${sequence++}`
-    host.commitRoot(host.self(ROOT_THREAD), {
-      type: "MessageReceived",
-      id: turn,
-      text: brief,
-      at: sequence
-    } as Event)
+    const target = await host.allocate({ kind: "root", coordinate: parseThreadAddress(host.self(ROOT_THREAD)) })
+    const prepared = prepareInvocation({
+      reference: { target, invocation: { method: "message", id: turn, epoch: 0 } },
+      method: message, input: { text: brief }, at: Date.now()
+    })
+    await host.commitRoot(formatThreadAddress(target), prepared.event)
     return turn
   }
   const result = (turn: string) => {
-    const boundary = boundaryOf(host.read(ROOT_THREAD), turn)
-    if (boundary?.kind === "completed") return { turn, output: boundary.output }
-    if (boundary?.kind === "failed") return { turn, error: boundary.error }
+    const state = message.state(host.read(ROOT_THREAD), { method: "message", id: turn, epoch: 0 })
+    if (state?.status === "completed") return { turn, output: Schema.decodeUnknownSync(Schema.String)(state.output) }
+    if (state?.status === "failed") return { turn, error: state.error }
+    if (state?.status === "cancelled") return { turn, error: state.reason ?? "cancelled" }
     return { turn, error: "the root did not reach a terminal boundary" }
   }
   const drive = (): Promise<void> => host.drive()
   const run = async (brief: string) => {
-    const turn = enqueue(brief)
+    const turn = await enqueue(brief)
     await drive()
     return result(turn)
   }

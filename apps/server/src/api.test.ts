@@ -8,7 +8,8 @@ import { HttpServer } from "effect/unstable/http"
 import { BunHttpServer } from "@effect/platform-bun"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import type { ThreadEventRow } from "@clavia/tardigrade-core/log"
-import { Ingress } from "@clavia/tardigrade-host/communication/ingress"
+import type { ThreadAllocator } from "@clavia/tardigrade-core/actor/allocation"
+import { Ingress } from "@clavia/tardigrade-host/transport/ingress"
 import { ACTOR_ARTIFACT_VERSION, Infer, type InferDelta, type InferRequest } from "tardie"
 import type { Action } from "tardie/log/events"
 
@@ -115,22 +116,22 @@ const catalog: ModelCatalog = {
 const catalogLayer = layerModelCatalogValue(catalog)
 const inference = makeInferenceStream()
 
-const app = Layer.provideMerge(serve({ disableLogger: true, disableListenLog: true, api: { inference } }), [
+const app = (threadAllocator?: typeof ThreadAllocator.Service) => Layer.provideMerge(serve({ disableLogger: true, disableListenLog: true, api: { inference } }), [
   BunHttpServer.layer({ port: 0 }),
   config,
   catalogLayer,
-  Layer.provide(layerThreads({ infer: layerScripted }), [config, catalogLayer])
+  Layer.provide(layerThreads({ infer: layerScripted, ...(threadAllocator === undefined ? {} : { threadAllocator }) }), [config, catalogLayer])
 ])
 
 // Boots the process and hands the body its base URL. The body is plain fetch, because a client of
 // this API is plain fetch.
-const serving = <A>(body: (base: string) => Promise<A>): Promise<A> =>
+const serving = <A>(body: (base: string) => Promise<A>, threadAllocator?: typeof ThreadAllocator.Service): Promise<A> =>
   Effect.gen(function*() {
     const server = yield* HttpServer.HttpServer
     const address = server.address
     const port = address._tag === "TcpAddress" ? address.port : 0
     return yield* Effect.promise(() => body(`http://127.0.0.1:${port}`))
-  }).pipe(Effect.provide(app), Effect.scoped, Effect.runPromise) as Promise<A>
+  }).pipe(Effect.provide(app(threadAllocator)), Effect.scoped, Effect.runPromise) as Promise<A>
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -174,6 +175,11 @@ const turnOf = async (base: string, thread: string, turn: string): Promise<TurnV
 }
 
 const birth = async (base: string, id: string, message: { id: string; text: string }) => {
+  expect((await post(base, "/v1/actors/main/threads", { name: id })).status).toBe(200)
+  return messageThread(base, id, message)
+}
+
+const messageThread = async (base: string, id: string, message: { id: string; text: string }) => {
   const response = await post(base, `/v1/actors/main/threads/${id}/events`, {
     type: "MessageReceived",
     ...message
@@ -187,6 +193,7 @@ const birth = async (base: string, id: string, message: { id: string; text: stri
 }
 
 const callMessage = async (base: string, thread: string, call: string, text: string) => {
+  expect((await post(base, "/v1/actors/main/threads", { name: thread })).status).toBe(200)
   const response = await put(
     base,
     `/v1/actors/main/threads/${thread}/methods/message/calls/${call}`,
@@ -325,8 +332,50 @@ describe("actor methods", () => {
     expect(budget?.inputSchema.$ref).toBe("#/$defs/BudgetRequestInput")
   })
 
-  test("an invocation births a thread and exposes its completed state", async () => {
+  test("HTTP allocates fresh callable roots without names", async () => {
+    await serving(async (base) => {
+      const first = await post(base, "/v1/actors/main/threads", {})
+      const second = await post(base, "/v1/actors/main/threads", {})
+      expect(first.status).toBe(200)
+      expect(second.status).toBe(200)
+      const target = await first.json() as { thread: string }
+      const other = await second.json() as { thread: string }
+      expect(target.thread).toMatch(/^[a-z]+-[a-z]+-[a-z2-7]{4}$/)
+      expect(other.thread).not.toBe(target.thread)
+      expect((await put(base, `/v1/actors/main/threads/${target.thread}/methods/message/calls/m1`, { text: "hello" })).status).toBe(202)
+    })
+  })
+
+  test("HTTP invokes the assigned root ID without reallocating it", async () => {
+    const names: string[] = []
+    await serving(async (base) => {
+      const allocated = await post(base, "/v1/actors/main/threads", { name: "lab" })
+      expect(allocated.status).toBe(200)
+      const target = await allocated.json() as { thread: string }
+      expect(target.thread).toBe("host-lab")
+      expect((await put(base, "/v1/actors/main/threads/lab/methods/message/calls/m1", { text: "hello" })).status).toBe(404)
+      expect((await put(base, `/v1/actors/main/threads/${target.thread}/methods/message/calls/m1`, { text: "hello" })).status).toBe(202)
+      const repeated = await post(base, "/v1/actors/main/threads", { name: "lab" })
+      expect(await repeated.json()).toEqual(target)
+      expect(names).toEqual(["lab", "lab"])
+    }, { allocate: (request) => Effect.sync(() => {
+      if (request.kind !== "root") throw new Error("unexpected child allocation")
+      names.push(request.coordinate.thread)
+      return { ...request.coordinate, thread: `host-${request.coordinate.thread}` }
+    }) })
+  })
+
+  test("allocation creates a thread before invocation and retries preserve its log", async () => {
     const result = await serving(async (base) => {
+      expect((await put(base, "/v1/actors/main/threads/alpha/methods/message/calls/m1", { text: "hello" })).status).toBe(404)
+      expect((await post(base, "/v1/actors/main/threads/alpha/events", { type: "MessageReceived", id: "m1", text: "hello" })).status).toBe(404)
+      const allocated = await post(base, "/v1/actors/main/threads", { name: "alpha" })
+      expect(allocated.status).toBe(200)
+      expect(await allocated.json()).toMatchObject({ instance: "main", thread: "alpha" })
+      const before = await (await get(base, "/v1/actors/main/threads/alpha/events")).json()
+      expect(before).toHaveLength(1)
+      await post(base, "/v1/actors/main/threads", { name: "alpha" })
+      expect(await (await get(base, "/v1/actors/main/threads/alpha/events")).json()).toEqual(before)
       const response = await put(base, "/v1/actors/main/threads/alpha/methods/message/calls/m1", {
         text: "hello",
         model: { provider: "openai", model_id: "gpt-test" }
@@ -368,8 +417,41 @@ describe("actor methods", () => {
     expect(read.state).toEqual({ status: "completed", output: "ok: hello" })
   })
 
+  test("reference reads pin the epoch and reject another deployed actor", async () => {
+    await serving(async (base) => {
+      await callMessage(base, "alpha", "m1", "hello")
+      const path = "/v1/actors/main/threads/alpha/methods/message/calls/m1"
+      const accepted = await (await put(base, path, { text: "hello" })).json() as { reference: { target: { actor: string } } }
+      const actor = encodeURIComponent(accepted.reference.target.actor)
+      const exact = await get(base, `${path}?epoch=0&actor=${actor}`)
+      expect(await exact.json()).toEqual({ status: "completed", output: "ok: hello" })
+      const otherEpoch = await get(base, `${path}?epoch=1&actor=${actor}`)
+      expect(await otherEpoch.json()).toEqual({ status: "pending" })
+      expect((await get(base, `${path}?epoch=0&actor=other`)).status).toBe(400)
+      expect((await put(base, `${path}/cancellation?epoch=0&actor=other`, {})).status).toBe(400)
+    })
+  })
+
+  test("HTTP preserves opaque instance refs in accepted invocation coordinates", async () => {
+    await serving(async (base) => {
+      await post(base, "/v1/actors/tenant%3Awest/threads", { name: "root" })
+      const path = "/v1/actors/tenant%3Awest/threads/root/methods/message/calls/m1"
+      const response = await put(base, path, { text: "hello" })
+      expect(response.status).toBe(202)
+      expect(await response.json()).toMatchObject({
+        reference: { target: { instance: "tenant:west", thread: "root" },
+          invocation: { method: "message", id: "m1", epoch: 0 } }
+      })
+      const events = await (await get(base, "/v1/actors/tenant%3Awest/threads/root/events")).json() as ReadonlyArray<EventRow>
+      expect(events.find((row) => row.event.type === "ThreadCreated")?.event).toMatchObject({
+        address: { instance: "tenant:west", thread: "root" }
+      })
+    })
+  })
+
   test("an invocation exposes and honors its selected timeout", async () => {
     const result = await serving(async (base) => {
+      await post(base, "/v1/actors/main/threads", { name: "alpha" })
       const response = await put(
         base,
         "/v1/actors/main/threads/alpha/methods/message/calls/m1?timeoutMs=25",
@@ -420,6 +502,7 @@ describe("actor methods", () => {
 
   test("a method without cancellation refuses the control request", async () => {
     const refusal = await serving(async (base) => {
+      await post(base, "/v1/actors/main/threads", { name: "alpha" })
       const invoked = await put(
         base,
         "/v1/actors/main/threads/alpha/methods/requestBudget/calls/b1",
@@ -440,6 +523,7 @@ describe("actor methods", () => {
 
   test("an invalid input is refused before it reaches the log", async () => {
     const refusal = await serving(async (base) => {
+      await post(base, "/v1/actors/main/threads", { name: "alpha" })
       const response = await put(base, "/v1/actors/main/threads/alpha/methods/message/calls/m1", {})
       return { status: response.status, body: await response.json() as Record<string, unknown> }
     })
@@ -451,6 +535,7 @@ describe("actor methods", () => {
 
   test("an unknown method names the methods the actor declares", async () => {
     const refusal = await serving(async (base) => {
+      await post(base, "/v1/actors/main/threads", { name: "alpha" })
       const response = await put(base, "/v1/actors/main/threads/alpha/methods/missing/calls/m1", {})
       return { status: response.status, body: await response.json() as Record<string, unknown> }
     })
@@ -650,6 +735,7 @@ describe("the event stream", () => {
     }]
     const waiters = new Set<(head: number) => void>()
     const actorThreads: ActorThreads = {
+      allocateRoot: () => Effect.die(new Error("unexpected allocation")),
       methods: {},
       sqlite: ":memory:",
       append: () => Effect.void,
@@ -990,12 +1076,12 @@ describe("the tree", () => {
       const tree = (await (await fetch(`${base}/v1/actors/main/threads/root/tree`)).json()) as ThreadNode
       const childId = tree.children[0]!.id
       const childEvents = (await (await fetch(`${base}/v1/actors/main/threads/${childId}/events`)).json()) as ReadonlyArray<EventRow>
-      expect(childId).toMatch(/^[0-9a-f]{64}$/)
+      expect(childId).toMatch(/^[a-z]+-[a-z]+-[a-z2-7]{4}$/)
       expect(childEvents.some(({ event }) => event.type === "TurnCompleted")).toBe(true)
       expect(childEvents[0]!.event).toMatchObject({
         address: { thread: childId }, parent: { thread: "root" }
       })
-      await birth(base, childId, { id: "follow-up", text: "hello again" })
+      await messageThread(base, childId, { id: "follow-up", text: "hello again" })
       return {
         tree,
         listed: (await (await fetch(`${base}/v1/actors/main/threads`)).json()) as ReadonlyArray<ThreadSummary>,
