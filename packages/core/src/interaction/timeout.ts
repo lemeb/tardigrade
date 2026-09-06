@@ -52,7 +52,7 @@ const dispatchesOf = (log: ReadonlyArray<Event>): ReadonlyArray<RecordedDispatch
   return dispatch === undefined ? [] : [dispatch]
 })
 
-export interface InvocationDeadline {
+interface InvocationDeadline {
   readonly invocation: InvocationRef
   readonly deadlineAt: number
 }
@@ -143,7 +143,7 @@ const deadlineCancellationTransition = (invocation: InvocationRef, deadlineAt: n
 })
 
 // deadlineCancellationsAt projects the invocation deadlines an observed time has crossed into the same cancellation targets the caller path uses (timeout.test.ts, "cancellation selection projects one cancellation from an eligible invocation"; cancellation.test.ts, "the core event and key identify the target invocation independently of its requester").
-export const deadlineCancellationsAt = (
+const deadlineCancellationsAt = (
   log: ReadonlyArray<Event>,
   methods: ActorMethods,
   at: number

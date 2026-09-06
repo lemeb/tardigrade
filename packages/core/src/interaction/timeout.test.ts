@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test"
 import type { Event } from "@clavia/tardigrade-core/event"
 import {
   alarmFired,
-  deadlineCancellationsAt,
   deadlineCancellationEventsAt,
   earliestDeadlineOf,
   initialMethodTimeoutState,
@@ -132,9 +131,6 @@ describe("method alarms", () => {
         expected: [deadlineCancellation("work-1", 40, 50), deadlineCancellation("work-2", 45, 50)]
       }
     ]
-    expect(deadlineCancellationsAt([startedWork("work-1")], workMethods, 40)).toEqual([
-      { invocation: { method: "work", id: "work-1", epoch: 0 }, deadlineAt: 40 }
-    ])
     for (const current of cases) {
       expect(deadlineCancellationEventsAt(current.log, current.methods ?? workMethods, current.at), current.name)
         .toEqual(current.expected)
