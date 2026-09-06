@@ -8,7 +8,7 @@ import type { KeyValueStore } from "effect/unstable/persistence"
 import type { Event } from "@clavia/tardigrade-core/log/event"
 import { actor, actorMethod, component } from "@clavia/tardigrade-core/actor"
 import { effect } from "@clavia/tardigrade-core/effect"
-import { actorFromProjections, type Actor } from "@clavia/tardigrade-core/runtime"
+import { actorFromProjections, actorRuntimeOf, type Actor } from "@clavia/tardigrade-core/runtime"
 import { completeTransitionProjection, type ErasedTransitionProjection } from "@clavia/tardigrade-core/transition"
 import { methodTimeoutKeys, methodTimeoutDerivation } from "@clavia/tardigrade-core/interaction/timeout"
 import { formatThreadAddress, parseThreadAddress } from "@clavia/tardigrade-core/transport/endpoint"
@@ -106,34 +106,20 @@ const options = (path: string): BunHostOptions<never> => ({
   keyOf
 })
 
-// Both bun deadline properties drive one hold actor: a cancellable method whose invocation cancels
-// on record, so the atomic and alarm-only-repair tests share its fixture.
-interface HoldState {
-  readonly requests: ReadonlySet<string>
-  readonly cancelled: ReadonlySet<string>
-}
-const initialHoldState = (): HoldState => ({ requests: new Set(), cancelled: new Set() })
-const stepHoldState = (hold: HoldState, event: Event): HoldState => {
-  const id = String((event as { readonly id?: unknown }).id ?? "")
-  if (event.type === "HoldRequested" && !hold.requests.has(id)) {
-    return { ...hold, requests: new Set(hold.requests).add(id) }
-  }
-  if (event.type === "HoldCancelled" && !hold.cancelled.has(id)) {
-    return { ...hold, cancelled: new Set(hold.cancelled).add(id) }
-  }
-  return hold
-}
+// Both bun deadline properties drive one cancellable hold actor.
+const hasHoldEvent = (events: ReadonlyArray<Event>, type: string, id: string): boolean =>
+  events.some((event) => event.type === type && String((event as { readonly id?: unknown }).id) === id)
 const hold = actorMethod({
   input: Schema.Struct({ text: Schema.String }),
   output: Schema.String,
   event: ({ invocation, input, at }) => ({ type: "HoldRequested", id: invocation.id, text: input.text, at }),
   projection: {
-    initial: initialHoldState,
-    step: stepHoldState,
-    output: (hold: HoldState) => ({
+    initial: () => [] as ReadonlyArray<Event>,
+    step: (events, event) => [...events, event],
+    output: (events) => ({
       currentEpoch: () => 0,
-      invocationState: (invocation) => !hold.requests.has(invocation.id) ? undefined
-        : hold.cancelled.has(invocation.id)
+      invocationState: (invocation) => !hasHoldEvent(events, "HoldRequested", invocation.id) ? undefined
+        : hasHoldEvent(events, "HoldCancelled", invocation.id)
           ? { status: "cancelled" as const, cause: "deadline" as const }
           : { status: "pending" as const }
     })
@@ -142,7 +128,7 @@ const hold = actorMethod({
     event: (cancellation, at) => ({ type: "HoldCancelled", id: cancellation.invocation.id, at })
   }
 })
-const holdComponent = component<HoldState, undefined>({
+const holdComponent = component<undefined, undefined>({
   name: "hold",
   keys: {
     prefixes: ["hold-request:", "hold-cancel:"],
@@ -152,11 +138,26 @@ const holdComponent = component<HoldState, undefined>({
       return undefined
     }
   },
-  initial: initialHoldState,
-  step: stepHoldState,
+  initial: () => undefined,
+  step: () => undefined,
   output: () => ({ view: undefined, transitions: [] })
 })
 const holdActor = actor({ name: "echo", methods: { hold }, components: [holdComponent] })
+const holdRuntime = actorRuntimeOf(holdActor)
+const heldInvocation = (deadlineAt = 50): Event => ({
+  type: "HoldRequested",
+  id: "hold-1",
+  text: "held",
+  call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt },
+  at: 1
+}) as Event
+const deadlineHost = (path: string, alarm: ManualAlarmScheduler) => createBunHost({
+  database: path,
+  actorFor: () => holdActor,
+  keyOf: holdRuntime.keyOf,
+  alarm
+})
+const eventsOf = (events: ReadonlyArray<Event>, type: string) => events.filter((event) => event.type === type)
 
 describe("the bun host", () => {
   test("root creation awaits the configured reservation and reuses it on later messages", async () => {
@@ -511,22 +512,8 @@ describe("the bun host", () => {
   test("an alarm commits its deadline cancellation atomically", async () => {
     const path = freshPath()
     const alarm = new ManualAlarmScheduler()
-    const h = await createBunHost({
-      database: path,
-      actorFor: () => holdActor,
-      keyOf: holdActor.keyOf,
-      alarm
-    })
-    await h.seed("caller", [
-      created("caller"),
-      {
-        type: "HoldRequested",
-        id: "hold-1",
-        text: "held",
-        call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt: 50 },
-        at: 1
-      } as Event
-    ])
+    const h = await deadlineHost(path, alarm)
+    await h.seed("caller", [created("caller"), heldInvocation()])
     await h.recover()
     expect(alarm.pending).toEqual([50])
     expect(h.work()).toBe(0)
@@ -539,8 +526,8 @@ describe("the bun host", () => {
       BEGIN SELECT RAISE(ABORT, 'reject deadline cancellation'); END`)
     await expect(alarm.advanceTo(60)).rejects.toThrow()
     const rejected = await h.read("caller")
-    expect(rejected.filter((event) => event.type === "AlarmFired")).toEqual([])
-    expect(rejected.filter((event) => event.type === "CancellationRequested")).toEqual([])
+    expect(eventsOf(rejected, "AlarmFired")).toEqual([])
+    expect(eventsOf(rejected, "CancellationRequested")).toEqual([])
     expect(h.work()).toBe(0)
     expect(alarm.pending).toEqual([])
 
@@ -565,27 +552,16 @@ describe("the bun host", () => {
   test("an alarm-only log repairs its missing cancellation", async () => {
     const path = freshPath()
     const alarm = new ManualAlarmScheduler()
-    const h = await createBunHost({
-      database: path,
-      actorFor: () => holdActor,
-      keyOf: holdActor.keyOf,
-      alarm
-    })
+    const h = await deadlineHost(path, alarm)
     // A log written before the atomic alarm commits: the alarm fact landed, its cancellation did not.
     await h.seed("caller", [
       created("caller"),
-      {
-        type: "HoldRequested",
-        id: "hold-1",
-        text: "held",
-        call: { invocation: { method: "hold", id: "hold-1", epoch: 0 }, deadlineAt: 50 },
-        at: 1
-      } as Event,
+      heldInvocation(),
       { type: "AlarmFired", scheduledFor: 50, at: 60 } as Event
     ])
     await h.recover()
     const repaired = await h.read("caller")
-    expect(repaired.filter((event) => event.type === "CancellationRequested")).toHaveLength(1)
+    expect(eventsOf(repaired, "CancellationRequested")).toHaveLength(1)
     expect(repaired.find((event) => event.type === "CancellationRequested")).toMatchObject({
       request: "deadline/hold/hold-1/0/50",
       cause: "deadline"
@@ -594,7 +570,7 @@ describe("the bun host", () => {
     expect(await h.resting()).toBe(true)
     expect(alarm.pending).toEqual([])
     await h.drive()
-    expect((await h.read("caller")).filter((event) => event.type === "CancellationRequested")).toHaveLength(1)
+    expect(eventsOf(await h.read("caller"), "CancellationRequested")).toHaveLength(1)
     await h.close()
   })
 
