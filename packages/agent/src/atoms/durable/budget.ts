@@ -1,6 +1,6 @@
 import { durableAtom, RuntimeError } from "@clavia/tardigrade-core"
 import { Schema } from "effect"
-import { BudgetConfigured, BudgetUpdated, BudgetResolved, ModelCalled, TurnSettled, BudgetDecision, BudgetPolicy, BudgetMetric, type Event } from "../../contracts/events"
+import { BudgetConfigured, BudgetUpdated, BudgetResolved, ModelCalled, TurnRequested, TurnSettled, BudgetDecision, BudgetPolicy, BudgetMetric, type Event } from "../../contracts/events"
 
 export const BudgetState = Schema.Array(Schema.Struct({
   metric: BudgetMetric, turnId: Schema.optionalKey(Schema.String), policy: BudgetPolicy, granted: Schema.Finite,
@@ -20,6 +20,14 @@ export function reduceBudget(state: typeof BudgetState.Type, event: Event): type
     validateBudgetAmount(event.metric, event.policy.limit + (prior?.granted ?? 0))
     return prior ? state.map(entry => entry === prior ? { ...entry, policy: event.policy } : entry)
       : [...state, { metric: event.metric, policy: event.policy, granted: 0, decisions: [] }]
+  }
+  if (event.type === "TurnRequested") {
+    if (!event.budget) return state
+    validateBudgetAmount("toolCalls", event.budget.toolCalls)
+    const prior = state.find(entry => entry.metric === "toolCalls")
+    // A configured request tool stays available, so an exhausted child can ask its parent for more calls.
+    const policy = prior?.policy.requestTool ? { ...prior.policy, limit: event.budget.toolCalls } : { limit: event.budget.toolCalls, onExhausted: "deny" as const }
+    return prior ? state.map(entry => entry === prior ? { ...entry, policy } : entry) : [...state, { metric: "toolCalls", policy, granted: 0, decisions: [] }]
   }
   if (event.type === "ModelCalled" && event.purpose === "inference") {
     if (!state.some(entry => entry.turnId !== event.turnId)) return state
@@ -56,6 +64,6 @@ export function reduceBudget(state: typeof BudgetState.Type, event: Event): type
 
 export const budgetState = durableAtom({
   name: "agent.budget",
-  input: Schema.Union([BudgetConfigured, BudgetUpdated, BudgetResolved, ModelCalled, TurnSettled]),
+  input: Schema.Union([BudgetConfigured, BudgetUpdated, BudgetResolved, ModelCalled, TurnRequested, TurnSettled]),
   schema: BudgetState, initial: [], reduce: reduceBudget,
 })

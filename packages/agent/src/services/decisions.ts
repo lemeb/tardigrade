@@ -19,7 +19,7 @@ export const requestResult = <Value>(decision: Schema.Schema<Value>) => Schema.U
 export const deferDecision = <Value extends Schema.Json, Services>(work: Effect.Effect<Value, Error, Services>): Effect.Effect<RequestResult<Value>, Error, Services | EffectExecution> => Effect.gen(function* () {
   const execution = yield* EffectExecution
   const promise = durablePromise(execution.ref, { success: Schema.Json, error: Schema.String })
-  const handle = yield* execution.fork(work.pipe(Effect.exit, Effect.map(exit => Exit.isSuccess(exit) ? promise.succeed(exit.value) : promise.fail(Cause.pretty(exit.cause)))))
+  const handle = yield* execution.fork(work.pipe(Effect.exit, Effect.map(exit => Exit.isSuccess(exit) ? promise.succeed(exit.value) : promise.fail(Cause.prettyErrors(exit.cause).map(error => error.message).join("\n")))))
   return { type: "pending", handle }
 })
 

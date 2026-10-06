@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { durableAtom, ObservedCoreEvent, RuntimeError, EffectRef, InvocationRef, effectKey, ExecutionResult, DeliverMessage } from "@clavia/tardigrade-core"
-import { TurnRequested, ModelCalled, ModelFailed, ModelReturned, OutputRejected, ToolReturned, TurnSettled, AbortRequested, type Event } from "../../contracts/events"
+import { TurnRequested, ModelCalled, ModelFailed, ModelReturned, OutputRejected, ToolReturned, TurnSettled, AbortRequested, ActorReplyReceived, type Event } from "../../contracts/events"
 
 const Turn = Schema.Struct({
   turnId: Schema.String, invocationRef: Schema.NullOr(InvocationRef), settlement: Schema.NullOr(Schema.Literals(["completed", "failed", "cancelled"])), answer: Schema.NullOr(Schema.String), answerCallId: Schema.NullOr(Schema.String),
@@ -8,6 +8,8 @@ const Turn = Schema.Struct({
   calls: Schema.Array(Schema.Struct({ callId: Schema.String, returned: Schema.Boolean })),
   outstanding: Schema.Array(Schema.String),
   effects: Schema.Array(Schema.Struct({ ref: EffectRef, pending: Schema.Boolean })), failure: Schema.NullOr(Schema.String), cancellation: Schema.NullOr(Schema.String),
+  // reply is the first answer recorded for a child request turn.
+  reply: Schema.optionalKey(Schema.Json),
 })
 export const InferenceState = Schema.Struct({
   turns: Schema.Array(Turn),
@@ -81,6 +83,7 @@ export function inferState(state: typeof InferenceState.Type, event: Event | Obs
     if (event.outcome === "cancelled" && (turn.cancellation === null || turn.effects.some(work => work.pending))) throw new RuntimeError("Turn cancellation must drain accepted work before settlement")
     turns = turns.map(value => value === turn ? { ...value, settlement: event.outcome, ...(event.outcome === "failed" ? { failure: event.reason } : event.outcome === "cancelled" ? { cancellation: event.reason } : {}) } : value)
   }
+  if (event.type === "ActorReplyReceived" && event.turnId !== undefined) turns = updateTurn(turns, turn => turn.turnId === event.turnId && turn.reply === undefined, turn => ({ ...turn, reply: event.result }))
   if (event.type === "ToolReturned") turns = updateTurn(turns, turn => turn.outstanding.includes(event.callId), turn => ({ ...turn, outstanding: turn.outstanding.filter(id => id !== event.callId) }))
   if (turns === state.turns) return state
   const turn = turns.find(turn => turn.settlement === null)
@@ -105,7 +108,7 @@ export function turnOutput(events: readonly Event[], settlement: TurnSettled): s
 
 export const inferenceState = durableAtom({
   name: "agent.inference.state",
-  input: Schema.Union([TurnRequested, ModelCalled, ModelFailed, ModelReturned, OutputRejected, ToolReturned, TurnSettled, AbortRequested, ObservedCoreEvent]),
+  input: Schema.Union([TurnRequested, ModelCalled, ModelFailed, ModelReturned, OutputRejected, ToolReturned, TurnSettled, AbortRequested, ActorReplyReceived, ObservedCoreEvent]),
   schema: InferenceState,
   initial: initialInference,
   reduce: inferState,

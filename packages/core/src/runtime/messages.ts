@@ -7,6 +7,9 @@ import type { ActorMethods } from "../actor/method"
 import type { ThreadCoordinate } from "../actor/thread"
 import { DeliverMessage } from "../services/invocation"
 
+// replyMessageId identifies the reply a thread sends for an accepted message id.
+export const replyMessageId = (address: ThreadCoordinate, id: string) => JSON.stringify(["reply", address, id])
+
 const Obligation = Schema.Struct({ origin: Schema.Finite, id: Schema.NonEmptyString, target: MessageAddress, method: Schema.NonEmptyString, input: Schema.Json })
 
 // messageReplies retains return addresses until accepted delivery discharges their obligations.
@@ -28,7 +31,8 @@ export function messageReplies<Event extends object>(options: {
   })
   const requests = new Map<string, ReturnType<typeof DeliverMessage.request>>()
   return effectAtom(get => {
-    if (!options.address) return { view: null, events: {}, acts: {} }
+    const address = options.address
+    if (!address) return { view: null, events: {}, acts: {} }
     const pendingReplies = get(obligations)
     const remaining = new Set(pendingReplies.map(pending => pending.id))
     for (const id of requests.keys()) if (!remaining.has(id)) requests.delete(id)
@@ -42,7 +46,7 @@ export function messageReplies<Event extends object>(options: {
         if (body === undefined) return []
         request = DeliverMessage.request({
           origin: pending.origin,
-          input: { id: JSON.stringify(["reply", options.address, pending.id]), target: pending.target, body, inReplyTo: pending.id },
+          input: { id: replyMessageId(address, pending.id), target: pending.target, body, inReplyTo: pending.id },
           onSettled: (result, ref) => result.status === "fulfilled" ? [{ type: "MessageDelivered", id: pending.id, ref, receipt: result.value } satisfies MessageDelivered] : [],
         })
         requests.set(pending.id, request)

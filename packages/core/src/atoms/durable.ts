@@ -81,6 +81,7 @@ export function durableAtom<State, Event>(options: {
   const output = atom(get => get(reduced).state)
   return Object.assign(output, {
     input: options.input,
-    [AtomState]: { name: options.name, decode: restore, encode: (get: Getter) => encode(get(output)) },
+    // encode reads the reduction, so a labelled copy sharing this codec never mounts output as a second node of the same name.
+    [AtomState]: { name: options.name, decode: restore, encode: (get: Getter) => encode(get(reduced).state) },
   })
 }

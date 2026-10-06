@@ -14,7 +14,7 @@ import type { RuntimeEvent, JournalEvent, Journal, MessageJournal, RecordMetadat
 import type { ActorRuntime, ActorSetup, Requirements } from "./contracts"
 import type { ActorDefinition } from "../actor/definition"
 import { type MessageMetadata as DeliveryMetadata, type MessageReceipt, MessageAddress, MessageDelivered, MessageMetadata, MessageConflict, InvalidMessage, isMessageReceived } from "../actor/message"
-import type { ThreadCoordinate } from "../actor/thread"
+import type { ThreadCoordinate, ThreadCreated } from "../actor/thread"
 import { MethodInvocation, MethodCancellation, type ActorMethods } from "../actor/method"
 import { createEventLog, type EffectCheckpoint } from "./replay"
 import { isDeepStrictEqual } from "node:util"
@@ -23,7 +23,7 @@ import { WatchdogTerminalError, type RecoveryState } from "../services/watchdog"
 import { Promises, DEFAULT_PROMISE_POLICY, promiseDeadline, promisePolicy, type PromisePolicy } from "../services/promises"
 import { DEFAULT_CHECKPOINT_MAX_BYTES, checkpointDigest, decodeCheckpoint, encodeCheckpoint } from "../services/checkpoint"
 import { observeRequest, DEFAULT_EFFECT_INPUT_DIGEST_MIN_BYTES } from "./input-digest"
-import { messageReplies } from "./messages"
+import { messageReplies, replyMessageId } from "./messages"
 import { DeliverMessage, type MessageDelivery } from "../services/invocation"
 import { select } from "./stores/thread"
 
@@ -65,6 +65,7 @@ export function createActorStore<Event extends object, State, Services, Contract
   readonly promiseDelivery?: { readonly retryIntervalMs?: number }
   readonly promises?: Partial<PromisePolicy>
   readonly journal?: Journal<Event> | MessageJournal<Event>
+  readonly thread?: ThreadCreated
   readonly delivery?: DeliveryOptions
   readonly onEvent?: (event: RuntimeEvent<Event>) => void
 }) {
@@ -100,6 +101,7 @@ function createRuntime<Event extends object, const Atoms extends Readonly<Record
   readonly promiseDelivery?: { readonly retryIntervalMs?: number }
   readonly promises?: Partial<PromisePolicy>
   readonly journal?: Journal<Event> | MessageJournal<Event>
+  readonly thread?: ThreadCreated
   readonly delivery?: DeliveryOptions
   readonly onEvent?: (event: RuntimeEvent<Event>) => void
 }) {
@@ -587,6 +589,16 @@ function createRuntime<Event extends object, const Atoms extends Readonly<Record
       sub: store.sub,
       record: append,
       send,
+      ...(options.thread ? { thread: options.thread } : {}),
+      reply: (from, id) => Effect.gen(function* () {
+        const journal = options.journal
+        if (!journal || !("readMessage" in journal)) return yield* Effect.fail(new RuntimeError("Replies require an indexed journal"))
+        const found = yield* journal.readMessage(replyMessageId(from, id))
+        if (!found) return undefined
+        const { event, message } = found.record
+        if (!isMessageReceived(event) || message?.inReplyTo !== id || !isDeepStrictEqual(message.from, from)) return yield* Effect.fail(new RuntimeError("Reply identity differs from its sender"))
+        return event.body
+      }),
       fork: (id, work) => Effect.gen(function* () {
         if (options.inspect) return yield* Effect.fail(new RuntimeError("Actor inspection cannot fork work"))
         if (closed || background.has(id)) return yield* Effect.fail(new RuntimeError(`Cannot start background work: ${id}`))

@@ -1,11 +1,14 @@
+import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Random, Schema, Scope, Semaphore } from "effect"
 import { Actor, ActorRequest, ActorCall, type ActorCaller } from "../services/actor"
 import { atom, type Atom } from "../atoms/atom"
 import { InvalidMessage, type MessageMetadata, type MessageReceipt } from "../actor/message"
-import { MethodFailed, MethodCancelled, type ActorMethods, type MethodInput, type MethodOutput, type MethodResult } from "../actor/method"
+import { MethodFailed, MethodCancelled, methodResult, type ActorMethods, type MethodInput, type MethodOutput, type MethodResult } from "../actor/method"
 import { RuntimeError, type ExecutionHandle } from "./effects"
-import type { ThreadCoordinate, ThreadCreated } from "../actor/thread"
+import { ThreadCoordinate, type ThreadCreated } from "../actor/thread"
+import { Supervisor } from "../services/supervisor"
+import { Invocation } from "../services/invocation"
 import type { ActorDefinition } from "../actor/definition"
 import type { ActorRuntime, Requirements } from "./contracts"
 import { WatchdogTerminalError, type WatchdogTarget, type RecoveryState } from "../services/watchdog"
@@ -89,6 +92,84 @@ export function localActors(options: {
         yield* options.onReply(handle, requestId, value)
         yield* Deferred.succeed(pending, value)
       }),
+    } satisfies typeof Actor.Service
+  }))
+}
+
+// threadActors runs each call to one method in a journaled child of the calling thread; stable call identity, receiver deduplication, and the child's reply obligation give one logical execution per call (platform/quint/invocationReplay.qnt, oneLogicalExecution; quint/invocation/messageReply.qnt, replyRecoverable).
+export function threadActors(options: {
+  readonly runtime: Pick<ActorRuntime<object>, "thread" | "reply">
+  readonly method: string
+  readonly maxDepth: number
+}) {
+  if (!Number.isSafeInteger(options.maxDepth) || options.maxDepth < 0) throw new RuntimeError("maxDepth must be a nonnegative safe integer")
+  return Layer.effect(Actor, Effect.gen(function* () {
+    const supervisor = yield* Supervisor
+    const invocation = yield* Invocation
+    const invoked = new Map<string, ThreadCoordinate>()
+    const fenced = new Set<string>()
+    const locks = new Map<string, Semaphore.Semaphore>()
+    const serialize = <Value>(id: string, work: Effect.Effect<Value, Error>) => Effect.suspend(() => {
+      let lock = locks.get(id)
+      if (!lock) { lock = Semaphore.makeUnsafe(1); locks.set(id, lock) }
+      return lock.withPermit(work)
+    })
+    const caller = Effect.suspend(() => options.runtime.thread ? Effect.succeed(options.runtime.thread) : Effect.fail(new RuntimeError("Thread actors require a thread creation record")))
+    // child derives the coordinate from the caller and call identity, so cancellation can find a child whose handle was never retained.
+    const child = (created: ThreadCreated, id: string): ThreadCoordinate => ({ actor: created.address.actor, instance: created.address.instance, thread: createHash("sha256").update(JSON.stringify([created.address.thread, id])).digest("hex").slice(0, 32) })
+    // target reads a child coordinate from a handle; handles recorded by localActors carry none.
+    const target = (handle: ExecutionHandle) => Effect.gen(function* () {
+      if (handle.executor !== "actor") return yield* Effect.fail(new RuntimeError("Invalid actor handle"))
+      const endpoint = handle.endpoint
+      const value = endpoint === undefined ? undefined : yield* Effect.try((): unknown => JSON.parse(endpoint)).pipe(Effect.orElseSucceed(() => undefined))
+      if (!Schema.is(ThreadCoordinate)(value)) return undefined
+      const created = yield* caller
+      if (value.actor !== created.address.actor || value.instance !== created.address.instance) return yield* Effect.fail(new RuntimeError("Actor handle belongs to another instance"))
+      return { actor: value.actor, instance: value.instance, thread: value.thread }
+    })
+    const cancelChild = (coordinate: ThreadCoordinate, id: string) => invocation.send({
+      id: JSON.stringify(["cancel", options.method, id]), target: coordinate, body: { method: options.method, cancel: { id, reason: "Actor call cancelled" } },
+    }).pipe(Effect.asVoid)
+    return {
+      invoke: input => Effect.gen(function* () {
+        const call = yield* Schema.decodeEffect(ActorCall)(input)
+        return yield* serialize(call.id, Effect.gen(function* () {
+          if (fenced.has(call.id)) return yield* Effect.fail(new RuntimeError("Actor call cancelled"))
+          const created = yield* caller
+          if (call.target.actor !== created.address.actor) return yield* Effect.fail(new RuntimeError(`Unknown actor: ${call.target.actor}`))
+          if (call.method !== options.method) return yield* Effect.fail(new RuntimeError(`Unknown actor method: ${call.method}`))
+          if (created.depth >= options.maxDepth) return yield* Effect.fail(new RuntimeError(`Child depth limit reached: ${options.maxDepth}`))
+          const coordinate = yield* supervisor.allocate({ instance: created.address.instance, parent: created.address, name: child(created, call.id).thread })
+          yield* invocation.send({ id: call.id, target: coordinate, body: { method: call.method, input: call.input } })
+          invoked.set(call.id, coordinate)
+          return { executor: "actor", id: call.id, endpoint: JSON.stringify(coordinate) }
+        }))
+      }),
+      poll: handle => Effect.gen(function* () {
+        const coordinate = yield* target(handle)
+        if (!coordinate) return { status: "rejected" as const, reason: "Local actor handle is no longer available" }
+        const reply = yield* options.runtime.reply(coordinate, handle.id)
+        if (reply === undefined) return { status: "pending" as const }
+        const result = yield* Schema.decodeUnknownEffect(methodResult(Schema.Json))(reply).pipe(Effect.mapError(RuntimeError.from))
+        return result.status === "completed" ? { status: "fulfilled" as const, value: result.output } : { status: "rejected" as const, reason: result.status === "failed" ? result.error : result.reason }
+      }),
+      cancel: handle => Effect.gen(function* () {
+        if (handle.endpoint !== undefined) {
+          const coordinate = yield* target(handle)
+          if (coordinate) yield* cancelChild(coordinate, handle.id)
+          return
+        }
+        if (handle.executor !== "actor") return yield* Effect.fail(new RuntimeError("Invalid actor handle"))
+        yield* serialize(handle.id, Effect.gen(function* () {
+          const known = invoked.get(handle.id)
+          if (known) return yield* cancelChild(known, handle.id)
+          fenced.add(handle.id)
+          const found = yield* supervisor.lookup(child(yield* caller, handle.id))
+          // A child allocated before a restart may lack the invocation; its receiver rejects that cancellation, which leaves nothing to stop.
+          if (found) yield* cancelChild(found, handle.id).pipe(Effect.ignore)
+        }))
+      }),
+      reply: () => Effect.fail(new RuntimeError("No matching pending actor request")),
     } satisfies typeof Actor.Service
   }))
 }
@@ -181,9 +262,9 @@ export function createActorExecution<Event extends object, Services, State, Cont
     let pending = threads.get(key)
     if (!pending) {
       const journal = journalFor(coordinate)
-      pending = yield* Effect.cached(readThreadCreation(journal, coordinate).pipe(Effect.andThen(createActorStore<Event, State, Services, Contracts>({
+      pending = yield* Effect.cached(readThreadCreation(journal, coordinate).pipe(Effect.flatMap(thread => createActorStore<Event, State, Services, Contracts>({
         ...(options.checkpointPolicy ? { checkpoint: options.checkpointPolicy } : {}),
-        ...(options.effectInput ? { effectInput: options.effectInput } : {}), actor: options.actor, actorContext: options.actorContext, journal, ...(options.executionStream ? { executionStream: options.executionStream } : {}), ...(options.executionStreamBus ? { executionStreamBus: options.executionStreamBus } : {}), ...(options.canDrive ? { canDrive: options.canDrive(coordinate) } : {}), ...(options.promises ? { promises: options.promises } : {}), delivery: options.delivery(coordinate), services: runtime => options.services(coordinate, runtime),
+        ...(options.effectInput ? { effectInput: options.effectInput } : {}), actor: options.actor, actorContext: options.actorContext, journal, thread, ...(options.executionStream ? { executionStream: options.executionStream } : {}), ...(options.executionStreamBus ? { executionStreamBus: options.executionStreamBus } : {}), ...(options.canDrive ? { canDrive: options.canDrive(coordinate) } : {}), ...(options.promises ? { promises: options.promises } : {}), delivery: options.delivery(coordinate), services: runtime => options.services(coordinate, runtime),
       })), Effect.onError(() => Effect.sync(() => { threads.delete(key) }))))
       threads.set(key, pending)
     }

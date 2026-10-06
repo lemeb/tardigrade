@@ -58,6 +58,8 @@ export type ToolCalled = typeof ToolCalled.Type
 export const ToolReturned = Schema.Struct({ type: Schema.Literal("ToolReturned"), callId: Schema.String, output: Schema.String, error: Schema.NullOr(Schema.String), promise: Schema.optionalKey(ToolPromise) })
 export type ToolReturned = typeof ToolReturned.Type
 
+// TurnBudget caps tool calls for the requested turn and later turns of the thread.
+export const TurnBudget = Schema.Struct({ toolCalls: Schema.Finite.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)) })
 export const TurnRequested = event({
   type: "TurnRequested", turnId: Schema.String, text: Schema.String,
   content: Schema.optionalKey(Schema.Array(Schema.Union([
@@ -67,11 +69,13 @@ export const TurnRequested = event({
   invocationRef: Schema.optionalKey(InvocationRef),
   source: Schema.optionalKey(Schema.Literals(["user", "agent", "tool"])),
   promiseRef: Schema.optionalKey(EffectRef), outcome: Schema.optionalKey(Schema.Literals(["completed", "failed", "cancelled"])),
+  budget: Schema.optionalKey(TurnBudget),
 })
 export type TurnRequested = typeof TurnRequested.Type
 
 export const ActorRequestReceived = Schema.Struct({ type: Schema.Literal("ActorRequestReceived"), handle: ExecutionHandle, request: ActorRequest })
-export const ActorReplyReceived = Schema.Struct({ type: Schema.Literal("ActorReplyReceived"), handle: ExecutionHandle, requestId: Schema.String, result: Schema.Json })
+// turnId names the request turn a thread child's reply answers; local child replies carry none.
+export const ActorReplyReceived = Schema.Struct({ type: Schema.Literal("ActorReplyReceived"), handle: ExecutionHandle, requestId: Schema.String, result: Schema.Json, turnId: Schema.optionalKey(Schema.String) })
 
 const ModelMetadata = {
   model: ModelRef,

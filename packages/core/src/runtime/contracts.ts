@@ -6,6 +6,7 @@ import type { Proposed, ServicesOf, EffectExecution } from "../atoms/effect"
 import type { EffectRef } from "./effects"
 import type { PromisePolicy } from "../services/promises"
 import type { ExecutionStream } from "../services/execution-stream"
+import type { ThreadCoordinate, ThreadCreated } from "../actor/thread"
 
 export type Requirements<Atoms> = Exclude<ServicesOf<Proposed<Atoms[keyof Atoms] extends Atom<infer Value> ? Value : never>>, EffectExecution>
 
@@ -28,6 +29,10 @@ export interface ActorRuntime<Event extends object> {
   readonly fork: (id: string, work: Effect.Effect<void, Error>) => Effect.Effect<void, Error>
   readonly interrupt: (id: string) => Effect.Effect<void, Error>
   readonly cancel: (ref: EffectRef, reason: Schema.Json) => Effect.Effect<void, Error>
+  // thread is the creation record of an addressed thread; stores without a thread journal leave it undefined.
+  readonly thread?: ThreadCreated
+  // reply reads the accepted reply from an addressed thread to a message this thread sent, or undefined while none is recorded.
+  readonly reply: (from: ThreadCoordinate, id: string) => Effect.Effect<Schema.Json | undefined, Error>
 }
 
 export interface ActorSetup<Event extends object, Atoms extends Readonly<Record<string, Atom<unknown>>>, Contracts extends ActorMethods<Event> = ActorMethods<Event>> {
