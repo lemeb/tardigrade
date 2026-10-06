@@ -81,7 +81,7 @@ const notesLive = notes.implement({
 
 `MethodHints` supports MCP's `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, and optional `title`. Hints describe behaviour; permission policy controls execution. Treat annotations from remote, untrusted servers as untrusted data.
 
-`MethodExecution` accepts `"foreground"` or `"background"`; `DEFAULT_METHOD_EXECUTION` is `"foreground"`. Foreground calls wait for a result and may perform asynchronous I/O. Background calls return durable handles. For handlers that submit work to another executor, mark the RPC as background, declare `ExecutionHandle` as its success schema, and pass `{ submit: ["methodName"] }` to `implement`. Optional cancellation handlers use the same method names. Code mode accepts foreground methods.
+`MethodExecution` accepts `"foreground"` or `"background"`; `DEFAULT_METHOD_EXECUTION` is `"foreground"`. Foreground calls wait for a result and may perform asynchronous I/O. Background calls return durable handles. For handlers that submit work to another executor, mark the RPC as background, declare `ExecutionHandle` as its success schema, and pass `{ submit: ["methodName"] }` to `implement`. Optional cancellation handlers use the same method names. In code mode, a background call parks the body until its handle settles. The body then runs again and reads earlier calls from the journal.
 
 Choose how to expose the configured libraries:
 
@@ -94,7 +94,7 @@ const directTools = tools(libraries)
 const researchCode = codeMode(libraries)
 ```
 
-Yield the chosen Effect during actor setup. Supply matching implementations in host services with `toolActs(libraries)` for direct tools or `codeModeActs(libraries)` for code mode. Both atoms also accept the host's full catalog when no library selection is supplied. Missing or duplicate selected library names fail during setup. Built-ins include `arxiv`, `fetch`, `workspace`, `agents`, and `alarm`.
+Yield the chosen Effect during actor setup. Supply matching implementations in host services with `toolActs(libraries)` for direct tools or `codeModeActs(libraries)` for code mode. Both atoms also accept the host's full catalog when no library selection is supplied. Missing or duplicate selected library names fail during setup. `codeMode(libraries, { permissions: AskPermission.request })` asks for each package call under action `package.execute` on resource `library.method`; an `ask` decision parks the body, and a denied call rejects inside it. Pass `onDenied: "fail"` to end the evaluation instead, so the `execute` call fails with the decision reason. Built-ins include `arxiv`, `fetch`, `workspace`, `agents`, and `alarm`.
 
 `arxiv().search` is exposed as `arxiv.search` inside code mode and `arxiv__search` as a direct tool. It returns the arXiv Atom XML feed with its source URL and applied pagination. `DEFAULT_ARXIV_POLICY` supplies pagination defaults; override them when constructing the library or per search call. `DEFAULT_ARXIV_ENDPOINT` can also be overridden. Applications own request pacing according to the [arXiv API guidance](https://info.arxiv.org/help/api/user-manual.html).
 

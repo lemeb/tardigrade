@@ -16,6 +16,7 @@ import { turnFactRecovery } from "./turn-facts"
 import { toolDeferredLifecycle } from "./tool-deferred-lifecycle"
 
 import { agentTurnCancellation, agentCancellationRecovery, codeModeCancellationRecovery, compactionCancellationRecovery } from "./agent-cancellation"
+import { codeModeWaitRecovery } from "./code-mode-waits"
 
 export const propertyCases = {
   stateValidation,
@@ -30,6 +31,8 @@ export const propertyCases = {
   agentTurnCancellation: () => fc.assert(agentTurnCancellation, RUNTIME_PROPERTY_OPTIONS),
   agentCancellationRecovery: () => fc.assert(agentCancellationRecovery, RUNTIME_PROPERTY_OPTIONS),
   codeModeCancellationRecovery: () => fc.assert(codeModeCancellationRecovery, RUNTIME_PROPERTY_OPTIONS),
+  // Each run reopens the thread at every commit boundary.
+  codeModeWaitRecovery: () => fc.assert(codeModeWaitRecovery, { ...RUNTIME_PROPERTY_OPTIONS, numRuns: 10 }),
   cancellationBatchIsolation: () => fc.assert(cancellationBatchIsolation, RUNTIME_PROPERTY_OPTIONS),
   cancellationForwarding: () => fc.assert(cancellationForwarding, RUNTIME_PROPERTY_OPTIONS),
   cancellationTerminality: () => fc.assert(cancellationTerminality, RUNTIME_PROPERTY_OPTIONS),

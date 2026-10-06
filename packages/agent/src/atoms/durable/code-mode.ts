@@ -1,17 +1,27 @@
-import { MethodRequested, MethodReturned, CodeCalled, CodeReturned, DomainEvent, EvaluateCode, ExecutePackage, type Event } from "../../contracts/code-mode"
+import { MethodRequested, MethodReturned, CodeCalled, CodeParked, CodeReturned, DomainEvent, EvaluateCode, ExecutePackage, type Event } from "../../contracts/code-mode"
 import { Schema } from "effect"
-import { EffectRef, durableAtom, effectKey, RuntimeError, EffectAcceptance, type RecordMetadata } from "@clavia/tardigrade-core"
+import { EffectRef, durableAtom, effectKey, RuntimeError, EffectAcceptance, EffectCancelled, type RecordMetadata } from "@clavia/tardigrade-core"
 import { ToolCall, ToolCalled, ModelReturned, ToolReturned } from "../../contracts/events"
 
 const Position = EffectRef.fields.seq
 const MethodRecord = Schema.Struct({ origin: Position, ordinal: MethodRequested.fields.ordinal, package: MethodRequested.fields.package, method: MethodRequested.fields.method, input: MethodRequested.fields.input, ref: Schema.NullOr(EffectRef), outcome: Schema.NullOr(MethodReturned.fields.outcome) })
 export const CodeModeState = Schema.Array(Schema.Struct({ call: ToolCall, origin: Schema.NullOr(Position), codeMode: Schema.NullOr(Schema.String), evaluation: Schema.NullOr(EffectRef), ambient: Schema.NullOr(CodeCalled.fields.ambient), returned: Schema.Boolean, calls: Schema.Array(MethodRecord), outcome: Schema.NullOr(CodeReturned.fields.outcome) }))
 
-// codeModeState retains code inputs and method receipts until their tool results are delivered.
-export function codeModeState(state: typeof CodeModeState.Type, event: typeof Event.Type | EffectAcceptance, _metadata: RecordMetadata = {}, position?: number): typeof CodeModeState.Type {
+// codeModeState retains code inputs and method receipts until their tool results are delivered; a parked attempt moves the evaluation origin to its cancellation, and calls never accepted end with the tool result.
+export function codeModeState(state: typeof CodeModeState.Type, event: typeof Event.Type | EffectAcceptance | EffectCancelled, _metadata: RecordMetadata = {}, position?: number): typeof CodeModeState.Type {
   if (event.type === "ModelReturned" && event.purpose === "inference") return [...state, ...event.toolCalls.map(call => ({ call, origin: null, codeMode: null, evaluation: null, ambient: null, returned: false, calls: [], outcome: null }))]
-  if (event.type === "ToolReturned") return state.flatMap(entry => entry.call.callId !== event.callId ? [entry]
-    : entry.calls.every(call => call.outcome !== null) ? [] : [{ ...entry, returned: true }])
+  if (event.type === "ToolReturned") return state.flatMap(entry => {
+    if (entry.call.callId !== event.callId) return [entry]
+    const calls = entry.calls.filter(call => call.ref !== null)
+    return calls.every(call => call.outcome !== null) ? [] : [{ ...entry, calls, returned: true }]
+  })
+  if (event.type === "EffectCancelled") {
+    if (!Schema.is(CodeParked)(event.reason)) return state
+    const entry = state.find(entry => entry.evaluation !== null && effectKey(entry.evaluation) === effectKey(event.ref))
+    if (!entry) return state
+    if (position === undefined) throw new RuntimeError("Code parking requires a journal position")
+    return state.map(value => value === entry ? { ...entry, origin: position, evaluation: null } : value)
+  }
   if (event.type === "ToolCalled") {
     if (event.codeMode === undefined) return state
     if (position === undefined) throw new RuntimeError("Code request requires a journal position")
@@ -54,4 +64,4 @@ export function codeModeState(state: typeof CodeModeState.Type, event: typeof Ev
   return state.flatMap(value => value !== entry ? [value] : next.returned && next.calls.every(call => call.outcome !== null) ? [] : [next])
 }
 
-export const executions = durableAtom({ name: "agent.code-mode.executions", input: Schema.Union([ModelReturned, ToolCalled, ToolReturned, DomainEvent, EffectAcceptance]), schema: CodeModeState, initial: [], reduce: codeModeState })
+export const executions = durableAtom({ name: "agent.code-mode.executions", input: Schema.Union([ModelReturned, ToolCalled, ToolReturned, DomainEvent, EffectAcceptance, EffectCancelled]), schema: CodeModeState, initial: [], reduce: codeModeState })

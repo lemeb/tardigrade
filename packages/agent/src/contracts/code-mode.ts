@@ -19,6 +19,10 @@ export const DomainEvent = Schema.Union([CodeCalled, CodeReturned, MethodRequest
 export const Event = Schema.Union([AgentEvent, DomainEvent])
 
 export const EvaluationInput = Schema.Struct({ ...Owner, code: Schema.String, libraries: Schema.optionalKey(Schema.Array(Schema.NonEmptyString)) })
-export const PackageInput = Schema.Struct({ ...Owner, ...Invocation.fields })
+export const PackageInput = Schema.Struct({ ...Owner, ...Invocation.fields, error: Schema.optionalKey(Schema.String) })
+// CodeParked is the cancellation reason that ends an evaluation attempt while its package calls wait; settled calls start the next attempt.
+export const CodeParked = Schema.TaggedStruct("CodeParked", {})
+// CodeDenied is the cancellation reason that ends an evaluation on a denied package call; the tool call fails with the decision reason.
+export const CodeDenied = Schema.TaggedStruct("CodeDenied", { reason: Schema.String })
 export const EvaluateCode = act({ name: "code-mode.evaluate", input: EvaluationInput, success: Schema.Json, failure: Schema.String })
 export const ExecutePackage = act({ name: "code-mode.package", input: PackageInput, success: Schema.Json, failure: Schema.String })

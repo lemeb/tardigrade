@@ -4,12 +4,19 @@ import { permissionState, PermissionState } from "./durable/permissions"
 import { Schema } from "effect"
 import { type ToolState } from "./durable/tools"
 import { type ToolSpec } from "@clavia/tardigrade-libraries/types"
-import { PermissionPolicy, type Event } from "../contracts/events"
+import { PermissionPolicy, type PermissionMode, type Event } from "../contracts/events"
 
 type PermissionView<R> = ActorOutput<typeof PermissionState.Type & {
   readonly position: "configuring" | "ready" | "checking" | "waiting"
 }, Event, R>
 export const DEFAULT_PERMISSION_POLICY: typeof PermissionPolicy.Type = { default: "ask", actions: {} }
+
+// permissionMode applies the resource rule, then the read-only rule, then the action and policy defaults.
+export function permissionMode(policy: typeof PermissionPolicy.Type, action: string, resource: string, readOnly?: boolean): typeof PermissionMode.Type {
+  const rule = Object.hasOwn(policy.actions, action) ? policy.actions[action] : undefined
+  return rule && Object.hasOwn(rule.resources, resource) ? rule.resources[resource]!
+    : readOnly === true && rule?.readOnly ? rule.readOnly : rule?.default ?? policy.default
+}
 
 // permissions records its initial policy and uses logged updates for subsequent calls.
 export function permissions(pendingTools: Atom<typeof ToolState.Type>, options: { readonly policy?: typeof PermissionPolicy.Type; readonly tools?: Atom<ActorOutput<{ readonly specs: readonly ToolSpec[] }, unknown, unknown>> } = {}): Atom<PermissionView<ActService<"agent.permission.request">>> {
@@ -25,9 +32,7 @@ export function permissions(pendingTools: Atom<typeof ToolState.Type>, options: 
     if (!call || state.decisions.some(value => value.action === "tool.execute" && value.requestId === call.callId)) return { view: { ...state, position: "ready" }, events: {}, acts: {} }
     const hints = options.tools ? get(options.tools).view.specs.find(tool => tool.name === call.name)?.annotations : undefined
     const metadata = hints?.readOnlyHint === undefined ? undefined : { readOnly: hints.readOnlyHint }
-    const rule = Object.hasOwn(state.policy.actions, "tool.execute") ? state.policy.actions["tool.execute"] : undefined
-    const mode = rule && Object.hasOwn(rule.resources, call.name) ? rule.resources[call.name]!
-      : metadata?.readOnly === true && rule?.readOnly ? rule.readOnly : rule?.default ?? state.policy.default
+    const mode = permissionMode(state.policy, "tool.execute", call.name, metadata?.readOnly)
     if (mode !== "ask") return {
       view: { ...state, position: "checking" },
       acts: {}, events: { permission: eventValue({

@@ -1,10 +1,10 @@
 import { isDeepStrictEqual } from "node:util"
 import { Cause, Clock, Effect, Exit, Layer, Schema } from "effect"
-import { atom, durablePromise, EffectExecution, effectKey, Isolate, RuntimeError } from "@clavia/tardigrade-core"
+import { atom, durablePromise, EffectExecution, effectKey, Isolate, RuntimeError, type EffectRef } from "@clavia/tardigrade-core"
 import { ToolCatalog } from "../actor/context"
 import { type AgentTool, type LibraryImplementation, type LibraryRequirements } from "@clavia/tardigrade-libraries"
 import { codeModeSpec } from "../contracts/libraries"
-import { CodeCalled, EvaluateCode, ExecutePackage, MethodRequested } from "../contracts/code-mode"
+import { CodeCalled, CodeParked, EvaluateCode, ExecutePackage, MethodRequested, type PackageInput } from "../contracts/code-mode"
 import { executions } from "../atoms/durable/code-mode"
 
 // codeModeActs supplies tool descriptions, isolate RPC, and independently durable library execution.
@@ -15,13 +15,14 @@ export function codeModeActs<const L extends readonly LibraryImplementation<unkn
   const spec = codeModeSpec(libraries, options.signatureDepth)
   const catalog = Layer.succeed(ToolCatalog, { names: ["execute"], specs: [spec], libraries })
   const registry = new Map(implementations.flatMap(pkg => (pkg.methods as readonly AgentTool<R>[]).map(method => [JSON.stringify([pkg.library.name, method.spec.name]), method] as const)))
+  const invocation = (input: typeof PackageInput.Type, ref: EffectRef) => ({ callId: effectKey(ref), parentCallId: input.callId, name: input.method, input: input.input })
   const executePackage = ExecutePackage.layer((input, { ref }) => Effect.gen(function* () {
+    if (input.error !== undefined) return yield* Effect.fail(input.error)
     const method = registry.get(JSON.stringify([input.package, input.method]))
     if (!method) return yield* Effect.fail(new RuntimeError(`Unknown library method: ${input.package}.${input.method}`))
-    const result = yield* method.execute(input.input, { callId: effectKey(ref), parentCallId: input.callId, name: input.method, input: input.input })
-    if (result.type !== "value") return yield* Effect.fail(new RuntimeError("Code mode cannot await background library results"))
-    return result.value
-  }).pipe(Effect.mapError(String)))
+    const result = yield* method.execute(input.input, invocation(input, ref))
+    return result.type === "promise" ? ExecutePackage.defer(result.handle) : result.value
+  }).pipe(Effect.mapError(String)), { cancel: (input, context) => registry.get(JSON.stringify([input.package, input.method]))?.cancel?.(context.handle, invocation(input, context.ref)) ?? Effect.void })
   const evaluateCode = EvaluateCode.layer(input => Effect.gen(function* () {
     const configured = input.libraries === undefined ? implementations : input.libraries.map(name => {
       const library = implementations.find(value => value.library.name === name)
@@ -57,12 +58,15 @@ export function codeModeActs<const L extends readonly LibraryImplementation<unkn
         return current && current.calls.every(call => call.outcome !== null) ? current : undefined
       })).pipe(Effect.mapError(String))
       if (drift) return yield* Effect.fail(drift)
-      if (seen.size !== completed.calls.length) return yield* Effect.fail("Nondeterministic code mode: replay omitted recorded library calls")
       if (Exit.isFailure(outcome)) return yield* Effect.fail(Cause.pretty(outcome.cause))
+      // A body that throws may stop before concurrent calls recorded by an earlier attempt reach the host.
+      if (outcome.value.error === undefined && seen.size !== completed.calls.length) return yield* Effect.fail("Nondeterministic code mode: replay omitted recorded library calls")
       return yield* Schema.decodeUnknownEffect(Schema.Json)(outcome.value).pipe(Effect.mapError(String))
     }).pipe(Effect.exit, Effect.map(exit => Exit.isSuccess(exit) ? reply.succeed(exit.value) : reply.fail(Cause.pretty(exit.cause))))
     return EvaluateCode.defer(yield* execution.fork(run))
   }).pipe(Effect.mapError(String)), { cancel: (input, context) => Effect.gen(function* () {
+    // A parked attempt leaves its package calls to the next attempt.
+    if (Schema.is(CodeParked)(context.reason)) return
     const owned = context.get(executions).find(entry => entry.call.callId === input.callId && entry.codeMode === input.codeMode)
     for (const call of owned?.calls ?? []) if (call.ref && call.outcome === null) yield* context.cancel(call.ref, context.reason)
   }) })

@@ -8,6 +8,7 @@ import { arxiv, workspace, memoryWorkspace } from "@clavia/tardigrade-libraries"
 import { ToolCatalog } from "@clavia/tardigrade-agent/actor/context"
 import { toolActs } from "@clavia/tardigrade-agent/services/tools"
 import { codeModeActs } from "@clavia/tardigrade-agent/services/code-mode"
+import { codeModeSpec } from "@clavia/tardigrade-agent/contracts/libraries"
 import { tools } from "@clavia/tardigrade-agent/atoms/tools"
 import { defineActor, Isolate } from "@clavia/tardigrade-core"
 import { codeMode } from "@clavia/tardigrade-agent/atoms/code-mode"
@@ -133,9 +134,9 @@ describe("RPC libraries", () => {
     expect(() => defineLibrary({ name: "notes", description: "", methods: [Rpc.make("stream", { payload: Schema.Struct({}), stream: true, success: Schema.String, error: Schema.String })] })).toThrow("unary")
     const implementation = notes.implement({ read: () => Effect.succeed("value") })
     expect(() => toolsFromLibraries([implementation, implementation])).toThrow("Duplicate library")
-    expect(() => codeModeActs([defineLibrary({ name: "jobs", description: "", methods: [
-      rpc.annotate(MethodExecution, "background"),
-    ] }).implement({ read: () => Effect.succeed("value") })])).toThrow("foreground")
+    const background = defineLibrary({ name: "jobs", description: "", methods: [rpc.annotate(MethodExecution, "background")] })
+    expect(() => codeModeActs([background.implement({ read: () => Effect.succeed("value") })])).not.toThrow()
+    expect(codeModeSpec([background]).description).toContain("jobs.read() -> settled result (background")
   })
 
   test("selects direct tools from the configured library catalog", async () => {

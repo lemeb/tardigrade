@@ -140,7 +140,7 @@ Use Effect `Rpc.make` payload, success, and error schemas in `defineLibrary({ na
 | `tools(libraries)` | `toolActs(implementations)` | Individual method tools |
 | `codeMode(libraries)` | `codeModeActs(implementations)` plus an isolate | Namespaced methods inside code |
 
-Foreground methods can perform asynchronous I/O and return a value. Background methods return durable handles; submitted external handles use `.implement(..., { submit, cancel })`. Code mode accepts foreground methods. Library adapters support unary RPCs without middleware. A live Cloudflare RPC reference is a transport capability, not a durable background handle.
+Foreground methods can perform asynchronous I/O and return a value. Background methods return durable handles; submitted external handles use `.implement(..., { submit, cancel })`. In code mode, a background call parks the body until its handle settles, then the body runs again from recorded calls. Library adapters support unary RPCs without middleware. A live Cloudflare RPC reference is a transport capability, not a durable background handle.
 
 Built-in factories such as `arxiv()` and `workspace()` return implementations with a `.library` contract. Actor declarations may select those contracts; execution layers supply implementations and dependencies. `arxiv` returns an Atom XML feed with pagination metadata. `memoryWorkspace` is ephemeral; use a persistent `Workspace` implementation when writes must survive restart. See the [SDK library example](../../docs/references/sdk.mdx#libraries) for a custom method and wiring.
 
